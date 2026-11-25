@@ -16,7 +16,7 @@ class NPCQuestTests(unittest.TestCase):
     def setUp(self):
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name)
+        root = Path(temporary.name).resolve()
         self.client_path, self.server_path, self.backups = root / "client.SData", root / "server.SData", root / "backups"
         empty = NPCQuestCatalog(bytes(13 * WORD.size) + EMPTY_FAMILY * 256 + bytes(WORD.size))
         client = empty.data.draft()

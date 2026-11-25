@@ -42,12 +42,12 @@ spaces and Unicode in the path, runs the bundled application with
 `--check-startup` and creates the platform archive. For example:
 
 ```sh
-python tools/release_archive.py linux-x64 v0.1.0-beta.1
+python tools/release_archive.py linux-x64 v0.1.0-beta.2
 ```
 
 ## GitHub Releases
 
-[The release workflow](../.github/workflows/release.yml) runs the same tests
+[The release workflow](https://github.com/Spelunkern/GX-Studio/blob/main/.github/workflows/release.yml) runs the same tests
 and packaging steps on native Linux, Windows and macOS runners. A tag
 beginning with `v` builds all four targets. After every target passes, the
 workflow attaches the archives and `SHA256SUMS.txt` to a GitHub pre-release.

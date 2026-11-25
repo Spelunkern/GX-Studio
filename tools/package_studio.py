@@ -41,6 +41,8 @@ def main():
                 shutil.copy2(package.locate_file(entry), target)
     for name in ("LICENSE", "NOTICE.md", "README.md"):
         shutil.copy2(source / name, portable)
+    for name in ("docs", "gallery"):
+        shutil.copytree(source / name, portable / name)
     print(portable)
 
 

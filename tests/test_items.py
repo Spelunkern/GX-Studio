@@ -151,7 +151,7 @@ class ItemCatalogTest(unittest.TestCase):
 
     def test_selected_server_uses_its_configured_runtime_and_never_its_seed(self):
         with TemporaryDirectory() as directory:
-            server = Path(directory) / "GX Server"
+            server = Path(directory).resolve() / "GX Server"
             game = server / "datos ñ" / "game"
             game.mkdir(parents=True)
             (server / ".local").mkdir()
