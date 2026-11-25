@@ -3,9 +3,10 @@
 from decimal import Decimal, InvalidOperation
 
 from PySide6.QtCore import QAbstractTableModel, QByteArray, QEvent, QModelIndex, QSize, QSortFilterProxyModel, Qt
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPushButton, QScrollArea, QStackedWidget, QTabWidget, QTableView,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QStackedWidget, QTabWidget, QTableView,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -14,7 +15,7 @@ from .install import save_model_table
 from .mon_view import MonPreview, configure_table, dialog_buttons
 from .monster_data import (
     CLIENT_FIELDS, CLIENT_BY_KEY, DB_FIELDS, DB_BY_KEY, DROPS, ELEMENTS, TABLE, U16, MonsterCatalog, drop_rate_max,
-    read_monster_db, save_mobs,
+    SYNC_BY_SQL, SYNC_FIELDS, plan_client_import, read_mobs, read_monster_db, save_mobs,
 )
 from .skill_sheet import SkillSizedDialog
 
@@ -22,6 +23,22 @@ DISPLAY = Qt.ItemDataRole.DisplayRole
 CLIENT, SQLITE = 0, 1
 STATES = ("Sleep", "Stun", "Silence", "Darkness", "Pause", "Slow", "Dying", "Death", "Poison", "Illness",
           "Delusion", "Doom", "Fear", "Dull", "Bad Luck")
+
+
+SQL_GREEN = "#20713d"
+SQL_RED = "#a82d32"
+SOURCE_LEGEND = (f'<span style="color:{SQL_GREEN}">SQLite</span> · '
+                 f'<span style="color:{SQL_RED}">SQLite differs from client</span> · Monster.SData')
+
+
+def comparison(client, sql_key, value):
+    client_key = SYNC_BY_SQL.get(sql_key)
+    if client_key in client:
+        before = client[client_key]
+        if value != before:
+            return SQL_RED, f"Differs from Monster.SData ({before})"
+        return SQL_GREEN, "Matches Monster.SData"
+    return SQL_GREEN, "SQLite value"
 
 
 def compact_grid(parent):
@@ -181,10 +198,8 @@ class MonsterDialog(SkillSizedDialog):
         self.panel = None
         self.field_status = QLabel("Select a field to see its source and editable range.")
         self.field_status.setWordWrap(True)
-        self.setStyleSheet(
-            'QLineEdit[mobSource="sqlite"]:enabled, QComboBox[mobSource="sqlite"]:enabled { background-color: #e5eef7; }'
-            'QCheckBox[mobSource="sqlite"]:enabled { color: #23517b; }'
-        )
+        self.field_status.setTextFormat(Qt.TextFormat.PlainText)
+
 
         layout = QVBoxLayout(self)
         content = QHBoxLayout()
@@ -201,8 +216,13 @@ class MonsterDialog(SkillSizedDialog):
         stats.addWidget(self.movement(), 3)
         form.addLayout(stats)
         form.addWidget(self.attacks())
-        form.addWidget(self.immunities())
-        form.addWidget(self.loots())
+        if server is not None:
+            form.addWidget(self.immunities())
+        elif not window.studio.legacy:
+            form.addWidget(QLabel("Server combat stats, immunities and loot require a GX SQLite row for this MobID."))
+        loot = self.loots()
+        form.addWidget(loot)
+        loot.setVisible(not window.studio.legacy)
         form.addStretch(1)
 
         self.side = QStackedWidget()
@@ -225,9 +245,8 @@ class MonsterDialog(SkillSizedDialog):
             self.model_control.currentIndexChanged.connect(self.refresh_preview)
 
         sources = QHBoxLayout()
-        state = "connected" if window.can_write_sqlite() else "read-only" if window.database else "unavailable"
-        sources.addWidget(QLabel(f"Client · Monster.SData    |    Blue fields · SQLite ({state})"), 1)
-        values = QPushButton("Source Values…")
+        sources.addWidget(QLabel(SOURCE_LEGEND if server is not None else "Client · Monster.SData"), 1)
+        values = QPushButton("More Monster Fields…")
         values.setAutoDefault(False)
         values.clicked.connect(self.open_sources)
         sources.addWidget(values)
@@ -235,6 +254,12 @@ class MonsterDialog(SkillSizedDialog):
         layout.addWidget(self.field_status)
         dialog_buttons(self, layout)
         self.source_dialog = self.build_source_dialog()
+        for rules in self.controls:
+            for field, widget in rules:
+                if field.key in SYNC_FIELDS or field.key in SYNC_BY_SQL:
+                    signal = widget.currentIndexChanged if isinstance(widget, QComboBox) else widget.textChanged
+                    signal.connect(self.update_source_indicators)
+        self.update_source_indicators()
         self.restore_size(QSize(705, 580))
         if self.preview_button.isEnabled() and self.settings.value("monster/showPreview", False, type=bool):
             self.toggle_panel(0)
@@ -282,21 +307,57 @@ class MonsterDialog(SkillSizedDialog):
         info = f"{field.label} · {text_source} · {field.key} · {limit}"
         if field.note:
             info += f"  {field.note}"
+        if values is None and source == SQLITE:
+            info += "  A GX SQLite database with a row for this MobID is required."
+        elif values is not None and not enabled:
+            info += f"  {text_source} is read-only."
         self.field_info[widget] = info
+        widget.setToolTip(info)
         widget.setAccessibleDescription(info)
         widget.installEventFilter(self)
         return widget
 
+    @staticmethod
+    def control_value(field, widget, previous):
+        try:
+            if isinstance(widget, QComboBox):
+                value = widget.currentData()
+            elif isinstance(widget, QCheckBox):
+                value = int(widget.isChecked())
+            else:
+                value = widget.text()
+            return field.parse(value)
+        except ValueError:
+            return previous
+
+    def update_source_indicators(self, *_):
+        client = dict(self.sources[CLIENT] or {})
+        for field, widget in self.controls[CLIENT]:
+            if field.key in SYNC_FIELDS:
+                client[field.key] = self.control_value(field, widget, client[field.key])
+        for field, widget in self.controls[SQLITE]:
+            value = self.control_value(field, widget, self.sources[SQLITE][field.key])
+            color, outcome = comparison(client, field.key, value)
+            widget.setStyleSheet(f"color: {color};" if value is not None else "")
+            description = f"{self.field_info[widget]} · {outcome}"
+            widget.setToolTip(description)
+            widget.setAccessibleDescription(description)
+            if widget.hasFocus():
+                self.field_status.setText(description)
+
     def eventFilter(self, watched, event):
         if event.type() == QEvent.Type.FocusIn and watched in self.field_info:
-            self.field_status.setText(self.field_info[watched])
+            self.field_status.setText(watched.accessibleDescription())
             if getattr(self, "source_dialog", None):
-                self.detail_status.setText(self.field_info[watched])
+                self.detail_status.setText(watched.accessibleDescription())
         return super().eventFilter(watched, event)
 
     def preferred(self, key, **options):
-        source = SQLITE if self.sources[SQLITE] is not None or key not in CLIENT_BY_KEY else CLIENT
-        return self.control(source, key, **options)
+        sql_key = SYNC_FIELDS.get(key, key)
+        server = self.sources[SQLITE] or {}
+        if server.get(sql_key) is not None or self.sources[CLIENT] is None or key not in CLIENT_BY_KEY:
+            return self.control(SQLITE, sql_key, **options)
+        return self.control(CLIENT, key, **options)
 
     def group(self, title):
         widget = QWidget()
@@ -315,8 +376,7 @@ class MonsterDialog(SkillSizedDialog):
     def header(self):
         widget = QWidget()
         grid = compact_grid(widget)
-        self.pair(grid, 0, 0, "Name", self.control(CLIENT if self.sources[CLIENT] is not None else SQLITE,
-                                                  "Name" if self.sources[CLIENT] is not None else "MobName"), 2)
+        self.pair(grid, 0, 0, "Name", self.preferred("Name"), 2)
         self.pair(grid, 1, 0, "Model", self.control(CLIENT, "Model"))
         self.preview_button = QPushButton(">>")
         self.preview_button.setFixedWidth(35)
@@ -337,6 +397,8 @@ class MonsterDialog(SkillSizedDialog):
             (("Def", "Defense"), ("Resist", "Magic"), ("Elem", "Attrib")),
         ), 1):
             for column, (label, key) in enumerate(cells):
+                if self.window.studio.legacy and key not in CLIENT_BY_KEY:
+                    continue
                 self.pair(grid, row, column * 2, label, self.preferred(key, width=91 if key in ("HP", "SP", "MP") else 68))
         self.pair(grid, 4, 0, "Height", self.control(CLIENT, "Day", width=75))
         self.pair(grid, 4, 2, "Radius", self.preferred("Size", width=68))
@@ -350,12 +412,24 @@ class MonsterDialog(SkillSizedDialog):
             grid.addWidget(QLabel(label), row, 0)
             grid.addWidget(self.preferred(f"Normal{suffix}", width=92), row, 1)
             grid.addWidget(self.preferred(f"Chase{suffix}", width=92), row, 2)
-        self.pair(grid, 4, 0, "Vision", self.control(SQLITE, "ChaseRange"), 2)
+        if not self.window.studio.legacy:
+            self.pair(grid, 4, 0, "Vision", self.control(SQLITE, "ChaseRange"), 2)
         self.pair(grid, 5, 0, "Quest Item", self.preferred("QuestItemID"), 2)
         return widget
 
     def attacks(self):
-        widget, grid = self.group("Attacks")
+        offline = self.sources[SQLITE] is None
+        widget, grid = self.group("Client attack settings" if offline else "Attacks")
+        if offline:
+            for column, title in enumerate(("Animation", "Client attack metadata"), 1):
+                grid.addWidget(QLabel(title), 1, column)
+            for slot in range(1, 4):
+                grid.addWidget(QLabel(str(slot)), slot + 1, 0)
+                grid.addWidget(self.control(CLIENT, f"AttackAnimation{slot}"), slot + 1, 1)
+                grid.addWidget(self.control(CLIENT, f"AttackType{slot}"), slot + 1, 2)
+            grid.setColumnStretch(1, 1)
+            grid.setColumnStretch(2, 1)
+            return widget
         columns = (
             ("Mode", "Attackok", 78), ("Damage", "Attack", 61), ("Addit.", "Attackplus", 57),
             ("Delay", "AttackTime", 91), ("Range", "Attackrange", 48), ("Attack Type", "AttackType", None),
@@ -367,13 +441,9 @@ class MonsterDialog(SkillSizedDialog):
             grid.addWidget(QLabel(str(slot)), slot + 1, 0)
             for column, (_, prefix, width) in enumerate(columns, 1):
                 key = f"{prefix}{slot}"
-                if self.sources[SQLITE] is None and prefix == "Attackok":
-                    control = self.control(CLIENT, f"AttackAnimation{slot}", width=width)
-                elif self.sources[SQLITE] is None and prefix == "AttackType":
-                    control = self.control(CLIENT, key)
-                else:
-                    control = self.control(SQLITE, key, width=width)
-                grid.addWidget(control, slot + 1, column)
+                if key != "Attackspecial3":
+                    grid.addWidget(self.control(SQLITE, key, width=width), slot + 1, column)
+        self.pair(grid, 5, 1, DB_BY_KEY["Attackspecial3"].label, self.control(SQLITE, "Attackspecial3"), 3)
         grid.setColumnStretch(6, 1)
         return widget
 
@@ -407,13 +477,15 @@ class MonsterDialog(SkillSizedDialog):
 
     def build_source_dialog(self):
         dialog = QDialog(self)
-        dialog.setWindowTitle("Monster Source Values")
+        dialog.setWindowTitle("More Monster Fields")
         layout = QVBoxLayout(dialog)
         tabs = QTabWidget()
         layout.addWidget(tabs)
         self.detail_status = QLabel("Select a field to see its editable range.")
         self.detail_status.setWordWrap(True)
-        entries = (("Client — Monster.SData", CLIENT_FIELDS), (f"SQLite — {TABLE}", DB_FIELDS))
+        entries = [("Client — Monster.SData", CLIENT_FIELDS)]
+        if not self.window.studio.legacy:
+            entries.append((f"SQLite — {TABLE}", DB_FIELDS))
         self.detail_controls = []
         for source, (title, fields) in enumerate(entries):
             scroll = QScrollArea()
@@ -423,7 +495,9 @@ class MonsterDialog(SkillSizedDialog):
             scroll.setWidget(content)
             tabs.addTab(scroll, title)
             if self.sources[source] is None:
-                form.addRow(QLabel("No row available for this MobID."))
+                message = ("This MobID has no client record." if source == CLIENT
+                           else "Connect a GX SQLite database containing this MobID to view server fields.")
+                form.addRow(QLabel(message))
                 continue
             shown = {field.key for field, _ in self.controls[source]}
             for field in fields:
@@ -566,19 +640,79 @@ class MonsterListModel(QAbstractTableModel):
         key = self.columns[index.column()][1]
         if role == Qt.ItemDataRole.TextAlignmentRole and key != "Name":
             return Qt.AlignmentFlag.AlignCenter
-        if role not in (DISPLAY, Qt.ItemDataRole.ToolTipRole):
+        if role not in (DISPLAY, Qt.ItemDataRole.ToolTipRole, Qt.ItemDataRole.ForegroundRole):
             return None
+        sql_key = SYNC_FIELDS.get(key, key)
+        color = None
         if key == "MobID":
-            value, source = mob_id, "MobID"
-        elif key == "Name" and key not in client:
-            value, source = server.get("MobName", ""), "SQLite"
-        elif key in server and key != "Day":
-            value, source = server[key], "SQLite"
+            value, detail = mob_id, "MobID"
+        elif key != "Day" and server.get(sql_key) is not None:
+            value = server[sql_key]
+            color, outcome = comparison(client, sql_key, value)
+            detail = f"SQLite · {outcome}"
         else:
-            value, source = client.get(key, ""), "Monster.SData"
+            value, detail = client.get(key, ""), "Monster.SData"
+        if role == Qt.ItemDataRole.ForegroundRole:
+            return QBrush(QColor(color)) if color else None
         if key == "Attrib" and isinstance(value, int) and 0 <= value < len(ELEMENTS):
             value = ELEMENTS[value]
-        return value if role == DISPLAY else f"{value} · {source}" if value != "" else None
+        return value if role == DISPLAY else f"{value} · {detail}" if value != "" else None
+
+
+class MonsterImportDialog(QDialog):
+    def __init__(self, window, rows):
+        super().__init__(window)
+        self.setWindowTitle("Import SQLite Values")
+        self.resize(650, 425)
+        self.window, self.rows = window, rows
+        layout = QVBoxLayout(self)
+        options = QHBoxLayout()
+        layout.addLayout(options)
+        self.scope = QComboBox()
+        self.scope.addItem("All matching MobIDs", None)
+        if window.selected() in rows:
+            self.scope.addItem(f"Selected MobID {window.selected()}", window.selected())
+        options.addWidget(self.scope)
+        self.names = QCheckBox("Include localized names")
+        options.addWidget(self.names)
+        options.addStretch()
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        self.preview = QPlainTextEdit(readOnly=True)
+        layout.addWidget(self.preview, 1)
+        layout.addWidget(QLabel("Import stages edits to Monster.SData. Save Client writes the file with a backup."))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self.import_button = buttons.addButton("Stage Import", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.scope.currentIndexChanged.connect(self.refresh)
+        self.names.toggled.connect(self.refresh)
+        self.refresh()
+
+    def refresh(self, *_):
+        selection = self.scope.currentData()
+        self.changes, skipped = plan_client_import(
+            self.window.catalog, self.window.client_edits, self.rows,
+            sorted(self.rows) if selection is None else (selection,), include_names=self.names.isChecked(),
+        )
+        messages = [f"{len(self.changes):,} field changes across {len({row[0] for row in self.changes}):,} MobIDs."]
+        if skipped:
+            messages.append(f"{len(skipped):,} source values do not fit the client field and will be skipped.")
+        if self.window.sql_edits:
+            messages.append("Import uses saved database values. Pending SQLite edits are excluded.")
+        self.summary.setText(" ".join(messages))
+        lines = [f"{mob_id} · {CLIENT_BY_KEY[key].label}   {before} → {after}"
+                 for mob_id, key, before, after in self.changes[:1000]]
+        if len(self.changes) > 1000:
+            lines.append(f"… and {len(self.changes) - 1000:,} more changes.")
+        lines.extend(f"Skipped {mob_id} · {label}: {value!r} · allowed {limits}"
+                     for mob_id, label, value, limits in skipped[:100])
+        if len(skipped) > 100:
+            lines.append(f"… and {len(skipped) - 100:,} more skipped values.")
+        self.preview.setPlainText("\n".join(lines))
+        self.import_button.setEnabled(bool(self.changes))
 
 
 class MonsterWindow(QMainWindow):
@@ -598,11 +732,16 @@ class MonsterWindow(QMainWindow):
         self.save_sql_action = menu.addAction("Save SQLite Mobs…", "Ctrl+Shift+S", self.save_sqlite)
         self.reload_action = menu.addAction("Reload Client…", self.reload_client)
         self.database_action = menu.addAction("Reload SQLite…", self.reload_sqlite)
-        menu.addAction("Select SQLite…", studio.choose_database)
+        menu.addAction("Select SQLite…", studio.choose_database).setVisible(not studio.legacy)
+        self.save_sql_action.setVisible(not studio.legacy)
+        self.database_action.setVisible(not studio.legacy)
         menu.addSeparator()
         menu.addAction("&Close", "Ctrl+W", self.close)
         edit = self.menuBar().addMenu("&Edit")
         self.edit_action = edit.addAction("Edit Monster…", "Return", self.edit)
+        tools = self.menuBar().addMenu("&Tools")
+        self.import_action = tools.addAction("Import SQLite Values…", self.import_database)
+        tools.menuAction().setVisible(not studio.legacy)
         view = self.menuBar().addMenu("&Views")
         self.show_empty = view.addAction("Show Empty Monsters")
         self.show_empty.setCheckable(True)
@@ -610,7 +749,9 @@ class MonsterWindow(QMainWindow):
         self.show_empty.toggled.connect(lambda checked: self.change_view("showEmpty", checked))
         view.addSeparator()
         self.groups = {}
-        for name in COLUMN_GROUPS:
+        for name, columns in COLUMN_GROUPS.items():
+            if studio.legacy and not any(key in CLIENT_BY_KEY for _, key in columns):
+                continue
             action = view.addAction(name)
             action.setCheckable(True)
             action.setChecked(self.settings.value(f"monster/{name}", False, type=bool))
@@ -645,6 +786,9 @@ class MonsterWindow(QMainWindow):
         layout.addWidget(search)
         layout.addWidget(self.client_label)
         layout.addWidget(self.sql_label)
+        self.sql_label.setVisible(not studio.legacy)
+        self.legend = QLabel(SOURCE_LEGEND)
+        layout.addWidget(self.legend)
         self.setCentralWidget(content)
         self.update_actions()
 
@@ -677,9 +821,12 @@ class MonsterWindow(QMainWindow):
     def changed(self):
         return bool(self.client_edits or self.sql_edits or self.drop_edits)
 
-    def can_write_sqlite(self):
+    def sqlite_loaded(self):
         connection = self.studio.connection
-        return self.database is not None and connection.path == self.database and connection.editable
+        return self.database is not None and connection.connected and connection.path == self.database
+
+    def can_write_sqlite(self):
+        return self.sqlite_loaded() and self.studio.connection.editable
 
     def selected(self):
         index = self.proxy.mapToSource(self.table.currentIndex())
@@ -692,15 +839,19 @@ class MonsterWindow(QMainWindow):
 
     def refresh(self, selected=None):
         count = len(self.catalog.records) if self.catalog is not None else 0
+        active_rows = self.rows if self.sqlite_loaded() else {}
         rows = []
-        for mob_id in sorted(set(range(count)) | self.rows.keys()):
+        for mob_id in sorted(set(range(count)) | active_rows.keys()):
             client = self.client_row(mob_id) or {}
-            server = self.rows.get(mob_id, {}) | self.sql_edits.get(mob_id, {})
+            server = active_rows[mob_id] | self.sql_edits.get(mob_id, {}) if mob_id in active_rows else {}
             if self.show_empty.isChecked() or max(client.get("Level") or 0, server.get("Level") or 0):
                 rows.append((mob_id, client, server))
         group_columns = tuple(column for name, action in self.groups.items() if action.isChecked()
                               for column in COLUMN_GROUPS[name])
-        self.model.replace(tuple(rows), (*BASE_COLUMNS, *(group_columns or DEFAULT_COLUMNS)))
+        columns = (*BASE_COLUMNS, *(group_columns or DEFAULT_COLUMNS))
+        if self.studio.legacy:
+            columns = tuple(column for column in columns if column[1] in CLIENT_BY_KEY or column[1] == "MobID")
+        self.model.replace(tuple(rows), columns)
         for row_number, (mob_id, _, _) in enumerate(rows):
             if mob_id == selected:
                 index = self.proxy.mapFromSource(self.model.index(row_number, 0))
@@ -720,9 +871,11 @@ class MonsterWindow(QMainWindow):
         self.reload_action.setEnabled(not busy and self.source is not None)
         self.database_action.setEnabled(not busy and self.source is not None and self.studio.connection.connected)
         self.edit_action.setEnabled(not busy and self.selected() is not None)
+        self.import_action.setEnabled(not busy and self.catalog is not None and self.catalog.writable and self.sqlite_loaded())
+        self.legend.setVisible(self.sqlite_loaded())
         self.setWindowTitle("Monster.SData" + (" *" if self.changed() else ""))
         self.client_label.setText(f"Client · {self.source}" if self.source else "Client · No monster file open")
-        state = "Connected" if self.can_write_sqlite() else "Read-only or disconnected"
+        state = ("Connected" if self.can_write_sqlite() else "Read-only") if self.sqlite_loaded() else "Disconnected"
         self.sql_label.setText(f"SQLite · {TABLE} · {state} · {self.database}" if self.database else
                                f"SQLite · {self.database_status or self.studio.connection.status}")
 
@@ -731,9 +884,9 @@ class MonsterWindow(QMainWindow):
         if mob_id is None:
             return
         client = self.client_row(mob_id)
-        stored = self.rows.get(mob_id)
+        stored = self.rows.get(mob_id) if self.sqlite_loaded() else None
         server = (stored | self.sql_edits.get(mob_id, {})) if stored is not None else None
-        drops = None if self.drops is None else self.drops.get(mob_id, {}) | {
+        drops = None if stored is None or self.drops is None else self.drops.get(mob_id, {}) | {
             slot: [entry] for slot, entry in self.drop_edits.get(mob_id, {}).items()
         }
         form = MonsterDialog(self, mob_id, client, server, drops)
@@ -757,6 +910,31 @@ class MonsterWindow(QMainWindow):
                     self.drop_edits.pop(mob_id, None)
             self.refresh(mob_id)
         form.deleteLater()
+
+    def import_database(self):
+        if not self.import_action.isEnabled():
+            return
+        path = self.database
+
+        def loaded(rows):
+            if not self.sqlite_loaded() or self.database != path:
+                return
+            form = MonsterImportDialog(self, rows)
+            if form.exec() != QDialog.DialogCode.Accepted or not self.sqlite_loaded() or self.database != path:
+                return
+            for mob_id, key, _, value in form.changes:
+                changes = self.client_edits.setdefault(mob_id, {})
+                if value == self.catalog.row(mob_id)[key]:
+                    changes.pop(key, None)
+                else:
+                    changes[key] = value
+                if not changes:
+                    self.client_edits.pop(mob_id)
+            if not self.sql_edits:
+                self.rows = rows
+            self.refresh(self.selected())
+
+        self.studio.run_task("Reading saved SQLite monster values…", lambda: read_mobs(path), loaded)
 
     def review(self, title, destination, action):
         box = QMessageBox(QMessageBox.Icon.Question, title, f"Save the staged edits to {destination}?", parent=self)

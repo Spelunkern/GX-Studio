@@ -27,7 +27,8 @@ MODEL_EXTENSIONS = frozenset((".3dc", ".3do", ".3de", ".ani", ".alt", ".smod", "
                               ".wtr", ".eft", ".seff", ".pc"))
 IMAGE_EXTENSIONS = frozenset((".dds", ".png", ".tga", ".bmp", ".jpg", ".jpeg", ".cur", ".ico"))
 FONT_EXTENSIONS = frozenset((".ttf", ".otf"))
-ASSET_EXTENSIONS = MODEL_EXTENSIONS | IMAGE_EXTENSIONS | FONT_EXTENSIONS | {".ogg", ".ctl"}
+AUDIO_EXTENSIONS = frozenset((".ogg", ".wav"))
+ASSET_EXTENSIONS = MODEL_EXTENSIONS | IMAGE_EXTENSIONS | FONT_EXTENSIONS | AUDIO_EXTENSIONS | {".ctl"}
 MAX_MODEL_BYTES = 32 * 1024 * 1024
 
 

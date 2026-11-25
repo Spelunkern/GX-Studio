@@ -4,19 +4,21 @@ from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from sqlite3 import Error as SQLiteError
-from tempfile import mkdtemp
+from tempfile import TemporaryDirectory, mkdtemp
 
 from PySide6.QtCore import QObject, QPoint, QRunnable, QSettings, QSize, QThreadPool, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QCloseEvent, QFont, QFontDatabase, QIcon, QPalette, QPixmap
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QFont, QFontDatabase, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import QApplication, QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox
 from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox
 from PySide6.QtWidgets import QPlainTextEdit, QStackedWidget, QStyle, QStyleFactory, QTabBar, QTableView, QTreeView, QTreeWidget
 from PySide6.QtWidgets import QTreeWidgetItem, QVBoxLayout, QWidget
 
 from .asset_view import ASSET_EXTENSIONS, ASSET_FILTER, AssetWindow, read_document
+from .binary_sdata import BinarySData, binary_schema
+from .binary_sdata_view import BinaryTableDialog
 from .cash_catalog import CashCatalog, validate_products
 from .cash_view import CashWindow
-from .catalog import Catalog, Edits, Item
+from .catalog import MAX_BYTES, Catalog, Edits, Item, read_file
 from .client_model_view import AUX_FILTER, ClientModelWindow, client_model_type
 from .equipment_models import ModelAssets, is_vehicle_mon
 from .fields import FIELDS_BY_NAME
@@ -29,6 +31,10 @@ from .itm_view import ItmWindow
 from .mlt_catalog import MltCatalog
 from .mlt_view import MltWindow
 from .lapis_fields import LAPIS_DEBUFF_FAMILIES
+from .legacy_archive import LegacySource, new_output_folder
+from .legacy_conversion import (
+    CONVERSION_EPISODES, TARGET_CATALOGS, attach_ep8_quest_translation, convert_catalog, inspect_catalog, inspect_source,
+)
 from .mon_catalog import MonCatalog
 from .mon_view import MonWindow
 from .monster_data import MonsterCatalog, read_monster_db
@@ -38,11 +44,11 @@ from .npcquest_data import NPCQuestCatalog
 from .npcquest_save import save_quest_catalog, validate_targets
 from .npcquest_view import NPCQuestWindow
 from .pickers import ItemEntry
-from .seed import file_envelope
+from .seed import episode_label, file_envelope
 from .skill_catalog import NPCSkillCatalog, SKILL_FIELDS_BY_NAME, SkillCatalog
 from .skill_view import SkillWindow
 from .sqlite_view import DebuffAssets, SQLiteWindow
-from .studio_settings import CLIENT_ROOT_KEY, DATABASE_KEY, SERVER_FOLDER_KEY
+from .studio_settings import CLIENT_ROOT_KEY, DATABASE_KEY, LEGACY_SOURCE_KEY, SERVER_FOLDER_KEY
 from .studio_settings import open_settings, remember_path, studio_directory, workspace_path
 from .workspace import TABLE, Workspace, read_database
 from .workspace_view import WorkspaceDialog
@@ -51,7 +57,7 @@ USER_ROLE = Qt.ItemDataRole.UserRole
 PATH_ROLE = USER_ROLE + 1
 POPULATED_ROLE = USER_ROLE + 2
 QUEST_SERVER_KEY = "npcQuest/serverPath"
-STUDIO_BETA = "GX Studio v0.1 Beta - .wld and .svmap not covered yet, some server contents not covered yet"
+STUDIO_BETA = "GX Studio v0.1 Beta - .wld and some server formats are not covered yet"
 SDATA_EDITORS = {
     "item.sdata": "items", "cash.sdata": "cash", "skill.sdata": "skills",
     "npcskill.sdata": "npc_skills", "npcquest.sdata": "npc_quest", "monster.sdata": "monsters",
@@ -152,6 +158,7 @@ class ItemWindow(QMainWindow):
         file.addAction("&Close", "Ctrl+W", self.close)
         self.save = file.addAction("&Save", "Ctrl+S", parent.review)
         self.install = file.addAction("&Install…", parent.install_items)
+        self.install.setVisible(not parent.legacy)
         self.reload = file.addAction("&Reload…", parent.reload_items)
         edit = self.menuBar().addMenu("&Edit")
         self.edit_item = edit.addAction("Edit item…", "Return", self.open_selected)
@@ -160,12 +167,10 @@ class ItemWindow(QMainWindow):
         edit.addAction("&Find…", "Ctrl+F", self.show_search)
         edit.addAction("Find &Next", "F3", self.next_match)
         tools = self.menuBar().addMenu("&Tools")
-        tools.addAction("Link SQLite for Export…", parent.choose_export_database)
+        tools.addAction("Link SQLite for Export…", parent.choose_export_database).setVisible(not parent.legacy)
         self.show_empty = tools.addAction("Show empty items")
         self.show_empty.setCheckable(True)
         self.show_empty.toggled.connect(self.refilter)
-        tools.addSeparator()
-        tools.addAction("EP5 format").setEnabled(False)
 
         self.tabs = QTabBar()
         self.tabs.setUsesScrollButtons(True)
@@ -398,7 +403,11 @@ class ItemWindow(QMainWindow):
             summary += f"    Type {item.family}    TypeID {item.type_id}"
         if changed:
             summary += f"    {changed} pending changes"
-        if not self.workspace.catalog.writable:
+        if getattr(self.workspace.catalog, "legacy_preview", False):
+            summary += "    EP5.4 preview · read-only"
+        elif getattr(self.workspace.catalog, "archive_preview", False):
+            summary += "    Archive preview · read-only"
+        elif not self.workspace.catalog.writable:
             summary += "    Encrypted (read-only)"
         self.statusBar().showMessage(summary)
 
@@ -441,18 +450,22 @@ class ItemWindow(QMainWindow):
 
 
 class Window(QMainWindow):
-    def __init__(self, database: Path | None = None, *, settings: QSettings | None = None):
+    def __init__(self, database: Path | None = None, *, settings: QSettings | None = None, legacy=False):
         super().__init__()
-        self.setWindowTitle("GX Studio")
-        self.resize(655, 350)
+        self.legacy = legacy
+        self.legacy_source = self.legacy_temp = self.legacy_episode = None
+        self.legacy_layouts = {}
+        self.setWindowTitle("GX Studio — Legacy Data" if legacy else "GX Studio")
+        self.resize(731, 350)
         self.setMinimumWidth(570)
         self.setWindowIcon(QIcon(str(APP_ICON)))
         self.workspace: Workspace | None = None
         self.data_root = Path()
         self.studio_dir = studio_directory()
         self.settings = settings if settings is not None else open_settings(self.studio_dir)
-        self.client_data = workspace_path(self.settings, CLIENT_ROOT_KEY, self.studio_dir)
-        self.server_folder = workspace_path(self.settings, SERVER_FOLDER_KEY, self.studio_dir)
+        self.last_legacy_source = workspace_path(self.settings, LEGACY_SOURCE_KEY, self.studio_dir) if legacy else None
+        self.client_data = None if legacy else workspace_path(self.settings, CLIENT_ROOT_KEY, self.studio_dir)
+        self.server_folder = None if legacy else workspace_path(self.settings, SERVER_FOLDER_KEY, self.studio_dir)
         self.server_data = server_data_folder(self.server_folder) if self.server_folder else None
         self.quest_link_path = None
         self.client_catalog = self.find_client_catalog(self.client_data)
@@ -463,11 +476,11 @@ class Window(QMainWindow):
         self.task: Task | None = None
         self.connection_task: Task | None = None
         self.on_success: Callable[[object], None] | None = None
-        self.manual_database = database.resolve() if database else workspace_path(
+        self.manual_database = None if legacy else database.resolve() if database else workspace_path(
             self.settings, DATABASE_KEY, self.studio_dir,
         )
         self.connection_request = None
-        self.connection = DatabaseStatus(None, "Detecting…", "Looking for GX Server")
+        self.connection = DatabaseStatus(None, "Client only" if legacy else "Detecting…", "" if legacy else "Looking for GX Server")
         self.item_window = ItemWindow(self)
         self.cash_window = CashWindow(self)
         self.skill_window = SkillWindow(self)
@@ -508,7 +521,9 @@ class Window(QMainWindow):
                 window.resize(saved_size)
 
         file = self.menuBar().addMenu("&File")
-        self.open_workspace = file.addAction("&Open Workspace…", "Ctrl+O", self.choose_workspace)
+        self.open_workspace = file.addAction(
+            "Open Client &Folder…" if legacy else "&Open Workspace…", "Ctrl+O", self.choose_workspace,
+        )
         self.workspace_settings = file.addAction("Workspace &Settings…", lambda: self.configure_workspace())
         self.open_source = file.addAction("Open Item.SData…", "Ctrl+Shift+O", self.choose_source)
         self.open_cash_source = file.addAction("Open Cash.SData…", self.choose_cash_source)
@@ -521,7 +536,11 @@ class Window(QMainWindow):
         self.open_client_model_source = file.addAction("Open ALT, Cloak or Emblem Table…", self.choose_client_model)
         self.open_monster_source = file.addAction("Open Monster.SData…", self.choose_monsters)
         self.open_asset_source = file.addAction("Open Asset…", self.choose_asset_source)
-        self.close_workspace = file.addAction("Close Client &Workspace", "Ctrl+W", self.close_current_workspace)
+        self.open_server_map_source = file.addAction("Open Server Map…", self.choose_server_map)
+        self.open_server_map_source.setVisible(not legacy)
+        self.close_workspace = file.addAction(
+            "Close &Client Data" if legacy else "Close Client &Workspace", "Ctrl+W", self.close_current_workspace,
+        )
         file.addSeparator()
         file.addAction("E&xit", "Ctrl+Q", self.close)
         edit = self.menuBar().addMenu("&Edit")
@@ -534,15 +553,33 @@ class Window(QMainWindow):
         self.open_database = views.addAction("Select SQLite…", self.choose_database)
         self.detect_database = views.addAction("Detect GX Database", "F5", self.detect_automatically)
         self.edit_database = views.addAction("Open SQLite Items", self.show_sqlite)
+        if legacy:
+            self.workspace_settings.setVisible(False)
+            self.reopen_legacy_action = self.make_legacy_action("Open Last Client Data", self.reopen_legacy)
+            file.insertAction(self.open_source, self.reopen_legacy_action)
+            file.insertAction(self.open_source, self.make_legacy_action("Open Client Table…", self.choose_binary_sdata))
+            views.menuAction().setVisible(False)
+            file.insertAction(self.open_source, self.make_legacy_action("Open Client Archive…", self.choose_legacy_archive))
+            self.extract_legacy_action = self.make_legacy_action("Extract Client Data…", self.extract_legacy)
+            file.insertAction(self.open_source, self.extract_legacy_action)
+            self.convert_legacy_action = self.make_legacy_action("Convert Catalogs to EP5.4…", self.convert_legacy)
+            file.insertAction(self.open_source, self.convert_legacy_action)
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(("Filename", "Size", "Date", "Status", "Encryption"))
+        self.tree.setHeaderLabels(("Filename", "Size", "Date", "Status", "Encryption", "Format"))
         self.tree.setUniformRowHeights(True)
         self.tree.setIconSize(QSize(16, 16))
         self.tree.header().setStretchLastSection(False)
-        for col, width in enumerate((200, 72, 114, 91, 128)):
+        for col, width in enumerate((200, 72, 114, 91, 128, 102)):
             self.tree.setColumnWidth(col, width)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.tree.itemDoubleClicked.connect(self.open_node)
+        self.sdata_formats = {}
+        for editor in self.sdata_editors():
+            label = QLabel()
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.hide()
+            editor.statusBar().addPermanentWidget(label)
+            self.sdata_formats[editor] = label
         self.tree.itemExpanded.connect(self.expand_data_folder)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.client_menu)
@@ -552,6 +589,7 @@ class Window(QMainWindow):
         layout.setSpacing(0)
         layout.addWidget(self.tree)
         self.beta_notice = QLabel(STUDIO_BETA)
+        self.beta_notice.setVisible(not legacy)
         self.beta_notice.setWordWrap(True)
         self.beta_notice.setContentsMargins(6, 4, 6, 4)
         layout.addWidget(self.beta_notice)
@@ -562,8 +600,9 @@ class Window(QMainWindow):
         self.connection_timer = QTimer(self)
         self.connection_timer.setInterval(8000)
         self.connection_timer.timeout.connect(self.refresh_connection)
-        self.connection_timer.start()
-        QTimer.singleShot(0, self.refresh_connection)
+        if not legacy:
+            self.connection_timer.start()
+            QTimer.singleShot(0, self.refresh_connection)
 
     def populate_tree(self):
         self.tree.clear()
@@ -586,6 +625,8 @@ class Window(QMainWindow):
         self.database_node.setIcon(0, style.standardIcon(QStyle.StandardPixmap.SP_DriveHDIcon))
         self.database_node.setData(0, USER_ROLE, "sqlite")
         self.update_database_node()
+        self.server_node.setHidden(self.legacy)
+        self.database_node.setHidden(self.legacy)
         if self.client_data is not None:
             self.client_node.setToolTip(0, str(self.client_data))
             available = self.client_data.is_dir()
@@ -594,6 +635,8 @@ class Window(QMainWindow):
             if available:
                 self.set_folder(self.all_files_node, self.client_data)
                 shortcuts = [self.client_cash]
+                if self.legacy:
+                    shortcuts.extend(self.client_data / path for path in self.legacy_layouts if binary_schema(path.name))
                 shortcuts.extend(find_child(find_child(self.client_data, folder), name)
                                  for folder, name in CLIENT_SHORTCUTS)
                 for path in shortcuts:
@@ -628,7 +671,14 @@ class Window(QMainWindow):
         while ancestor is not None and (value := ancestor.data(0, PATH_ROLE)):
             ancestors.add(Path(value).resolve())
             ancestor = ancestor.parent()
-        for is_dir, entry in sorted(entries, key=lambda item: (not item[0], item[1].name.casefold())):
+        def file_order(item):
+            is_dir, entry = item
+            stem = entry.stem
+            number = (int(stem) if entry.suffix.casefold() == ".svmap" and stem.isascii()
+                      and stem.isdecimal() else -1)
+            return not is_dir, number < 0, number, entry.name.casefold()
+
+        for is_dir, entry in sorted(entries, key=file_order):
             if is_dir:
                 child = QTreeWidgetItem(node, (entry.name,))
                 if entry.resolve() not in ancestors:
@@ -647,8 +697,12 @@ class Window(QMainWindow):
     def make_catalog_node(self, parent, path, status="", *, kind=None):
         extension = path.suffix.casefold()
         kind = kind or MODEL_EDITORS.get(extension) or SDATA_EDITORS.get(path.name.casefold())
+        if kind is None and self.legacy and binary_schema(path.name):
+            kind = "ep8_table"
         if kind is None and client_model_type(path) is not None:
             kind = "client_model"
+        if kind is None and not self.legacy and extension == ".svmap":
+            kind = "asset"
         kind = kind or ("asset" if extension in ASSET_EXTENSIONS else "file")
         size, modified = file_metadata(path)
         node = QTreeWidgetItem(parent, (path.name, size, modified, status))
@@ -657,14 +711,59 @@ class Window(QMainWindow):
         node.setToolTip(0, str(path))
         node.setData(0, USER_ROLE, kind)
         node.setData(0, PATH_ROLE, str(path))
+        if kind == "ep8_table":
+            node.setText(5, "EP8")
+        if kind in SDATA_EDITORS.values():
+            self.update_sdata_format(node, self.loaded_sdata().get(path.resolve()))
         return node
 
-    @staticmethod
-    def update_encryption(node, path):
+    def update_encryption(self, node, path):
         if path.suffix.casefold() == ".sdata":
-            value = file_envelope(path, known=path.name.casefold() in KNOWN_SDATA)
+            value = file_envelope(path, known=path.name.casefold() in KNOWN_SDATA or
+                                  (self.legacy and binary_schema(path.name) is not None))
             node.setText(4, value)
             node.setToolTip(4, value)
+
+    def sdata_editors(self):
+        return (self.item_window, self.cash_window, self.skill_window, self.npc_skill_window,
+                self.quest_window, self.monster_window)
+
+    def loaded_sdata(self):
+        return {path: catalog for path, catalog in (
+            (self.workspace.source, self.workspace.catalog) if self.workspace else (None, None),
+            *((editor.source, editor.catalog) for editor in self.sdata_editors()[1:]),
+        ) if path is not None and catalog is not None}
+
+    def catalog_format(self, catalog, path):
+        if not self.legacy:
+            return episode_label(catalog)
+        relative = path.relative_to(self.client_data) if self.client_data and path.is_relative_to(self.client_data) else None
+        episode = (getattr(catalog, "legacy_episode", None) or self.legacy_layouts.get(relative)
+                   or (self.legacy_episode if relative in self.legacy_layouts else None))
+        if episode == "5.4":
+            return episode_label(catalog, canonical=True)
+        if episode:
+            return f"EP{episode}"
+        return "Shared format" if catalog is not None else ""
+
+    def update_sdata_format(self, node, catalog):
+        path = Path(node.data(0, PATH_ROLE)).resolve()
+        text = self.catalog_format(catalog, path)
+        rich = "<span" in text
+        node.setText(5, "" if rich else text)
+        node.setToolTip(5, "EP5.4 (GX)" if rich else text)
+        if not rich:
+            if self.tree.itemWidget(node, 5) is not None:
+                self.tree.removeItemWidget(node, 5)
+            return
+        label = self.tree.itemWidget(node, 5)
+        if label is None:
+            label = QLabel()
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setAccessibleName("EP5.4 (GX)")
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            self.tree.setItemWidget(node, 5, label)
+        label.setText(text)
 
     def opened_catalogs(self):
         return {
@@ -677,6 +776,16 @@ class Window(QMainWindow):
 
     def update_catalog_nodes(self):
         opened = self.opened_catalogs()
+        loaded = self.loaded_sdata()
+        for editor, label in self.sdata_formats.items():
+            catalog = self.workspace.catalog if editor is self.item_window and self.workspace else getattr(editor, "catalog", None)
+            path = self.workspace.source if editor is self.item_window and self.workspace else getattr(editor, "source", None)
+            label.setText(self.catalog_format(catalog, path) if path else "")
+            label.setVisible(catalog is not None)
+        if self.legacy and self.legacy_source is None:
+            self.convert_legacy_action.setEnabled(any(path.name.casefold() in TARGET_CATALOGS
+                                                       and getattr(catalog, "legacy_episode", None) != "8"
+                                                       for path, catalog in loaded.items()))
         for node in self.standalone_nodes:
             self.shortcuts_node.removeChild(node)
         self.standalone_nodes.clear()
@@ -688,7 +797,9 @@ class Window(QMainWindow):
                 node.setText(3, "Loaded" if opened.get(kind) == path else "")
                 for column, value in enumerate(file_metadata(path), 1):
                     node.setText(column, value)
-                self.update_encryption(node, Path(node.data(0, PATH_ROLE)))
+                self.update_encryption(node, path)
+                if kind in SDATA_EDITORS.values():
+                    self.update_sdata_format(node, loaded.get(path))
         for kind, path in opened.items():
             if path is not None and path not in self.catalog_nodes:
                 if kind in ("itm", "mlt", "client_model") or is_vehicle_mon(path):
@@ -710,7 +821,8 @@ class Window(QMainWindow):
             menu.addAction(self.detect_database)
         else:
             return
-        menu.addAction(self.workspace_settings)
+        if not self.legacy:
+            menu.addAction(self.workspace_settings)
         menu.exec(self.tree.viewport().mapToGlobal(position))
 
     def update_server_node(self):
@@ -727,7 +839,9 @@ class Window(QMainWindow):
         node.takeChildren()
         if (source := self.workspace_server_quest()) is not None and source.is_file():
             self.make_catalog_node(node, source, kind="server_quest")
-            node.setExpanded(expanded)
+        if self.server_data and (maps := find_child(self.server_data, "maps")).is_dir():
+            self.set_folder(QTreeWidgetItem(node, (maps.name,)), maps)
+        node.setExpanded(expanded)
 
     def update_database_node(self):
         node = self.database_node
@@ -767,6 +881,8 @@ class Window(QMainWindow):
             self.open_npcquest(Path(item.data(0, PATH_ROLE)))
         elif kind == "monsters":
             self.open_monsters(Path(item.data(0, PATH_ROLE)))
+        elif kind == "ep8_table":
+            self.open_binary_sdata(Path(item.data(0, PATH_ROLE)))
         elif kind == "client_model":
             self.open_client_model(Path(item.data(0, PATH_ROLE)))
         elif kind in self.model_tables:
@@ -797,6 +913,35 @@ class Window(QMainWindow):
         self.item_window.showNormal()
         self.item_window.raise_()
         self.item_window.activateWindow()
+
+    def open_data_path(self, path, database=None):
+        if self.legacy:
+            database = None
+            if path.is_dir() or path.suffix.casefold() == ".sah":
+                self.open_legacy_client(path)
+                return
+            if binary_schema(path.name):
+                self.open_binary_sdata(path)
+                return
+        filename = path.name.casefold()
+        if filename == "cash.sdata":
+            self.open_cash(path, database)
+        elif filename == "skill.sdata":
+            self.open_skills(path, database)
+        elif filename == "npcskill.sdata":
+            self.open_skills(path, database, npc=True)
+        elif filename == "npcquest.sdata":
+            self.open_npcquest(path)
+        elif filename == "monster.sdata":
+            self.open_monsters(path)
+        elif client_model_type(path) is not None:
+            self.open_client_model(path)
+        elif path.suffix.casefold() in MODEL_EDITORS:
+            self.open_model_table(path)
+        elif path.suffix.casefold() in ASSET_EXTENSIONS or (not self.legacy and path.suffix.casefold() == ".svmap"):
+            self.open_asset(path)
+        else:
+            self.load(path, database)
 
     def open_catalog(self, source: Path):
         if self.task is not None:
@@ -838,6 +983,7 @@ class Window(QMainWindow):
         self.open_client_model_source.setEnabled(not busy)
         self.open_monster_source.setEnabled(not busy)
         self.open_asset_source.setEnabled(not busy)
+        self.open_server_map_source.setEnabled(not busy)
         self.open_workspace.setEnabled(not busy)
         self.workspace_settings.setEnabled(not busy)
         self.close_workspace.setEnabled(not busy and (self.workspace is not None or self.cash_window.source is not None
@@ -858,6 +1004,18 @@ class Window(QMainWindow):
         self.open_database.setEnabled(not busy and self.connection_task is None)
         self.detect_database.setEnabled(not busy and self.connection_task is None)
         self.edit_database.setEnabled(not busy and self.connection.connected)
+        if self.legacy:
+            self.reopen_legacy_action.setEnabled(not busy and self.last_legacy_source is not None
+                                                 and self.last_legacy_source.exists())
+            self.extract_legacy_action.setEnabled(not busy and self.legacy_source is not None)
+            if self.legacy_source is not None:
+                convertible = any(path.name.casefold() in TARGET_CATALOGS and episode != "8"
+                                  for path, episode in self.legacy_layouts.items())
+            else:
+                convertible = any(path.name.casefold() in TARGET_CATALOGS
+                                  and getattr(catalog, "legacy_episode", None) != "8"
+                                  for path, catalog in self.loaded_sdata().items())
+            self.convert_legacy_action.setEnabled(not busy and convertible)
         self.item_window.setEnabled(not busy)
         self.cash_window.setEnabled(not busy)
         self.skill_window.setEnabled(not busy)
@@ -869,6 +1027,8 @@ class Window(QMainWindow):
         self.client_model_window.setEnabled(not busy)
         self.monster_window.setEnabled(not busy)
         self.sqlite_window.setEnabled(not busy)
+        self.asset_window.setEnabled(not busy)
+        self.asset_window.update_map_status()
         self.item_window.update_status()
         self.cash_window.update_actions()
         self.skill_window.update_actions()
@@ -879,7 +1039,10 @@ class Window(QMainWindow):
         self.mlt_window.update_actions()
         self.client_model_window.update_actions()
         self.monster_window.update_actions()
-        if not busy:
+        if not busy and self.legacy_source:
+            episode = f"EP{self.legacy_episode} · " if self.legacy_episode else ""
+            self.statusBar().showMessage(f"{episode}{self.legacy_source.path}")
+        elif not busy:
             directory = self.client_data or (self.data_root if self.workspace is not None else None)
             self.statusBar().showMessage(str(directory) if directory else "Ready")
 
@@ -888,6 +1051,7 @@ class Window(QMainWindow):
             editor.changed() for editor in (
                 self.cash_window, self.skill_window, self.npc_skill_window, self.quest_window,
                 self.mon_window, self.itm_window, self.mlt_window, self.client_model_window, self.monster_window,
+                self.asset_window,
             )
         )):
             return True
@@ -896,6 +1060,211 @@ class Window(QMainWindow):
             QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         ) == QMessageBox.StandardButton.Discard
+
+    def make_legacy_action(self, text, callback):
+        action = QAction(text, self)
+        action.triggered.connect(callback)
+        return action
+
+    def choose_legacy_archive(self):
+        file, _ = QFileDialog.getOpenFileName(
+            self, "Open Client Archive", str(self.legacy_open_directory()), "SAH (*.sah *.SAH)",
+        )
+        if file:
+            self.open_legacy_client(Path(file))
+
+    def open_legacy_client(self, path):
+        if self.task is not None or not self.confirm_discard():
+            return
+
+        def read():
+            source = LegacySource.open(path)
+            if source.archive is None:
+                try:
+                    directory = self.resolve_client_data(source.path)
+                except ValueError:
+                    if not any(binary_schema(entry.path.name) for entry in source.entries):
+                        raise
+                else:
+                    if directory != source.path:
+                        source = LegacySource.open(directory)
+            layouts, episode = inspect_source(source)
+            temporary = None
+            directory = source.path
+            if source.archive:
+                temporary = TemporaryDirectory(prefix="gx-client-")
+                try:
+                    directory = Path(temporary.name) / "data"
+                    source.extract(directory)
+                except Exception:
+                    temporary.cleanup()
+                    raise
+            return source, directory, temporary, layouts, episode
+
+        def loaded(result):
+            source, directory, temporary, layouts, episode = result
+            old_temp = self.legacy_temp
+            self.legacy_source, self.legacy_temp = source, temporary
+            self.legacy_layouts, self.legacy_episode = layouts, episode
+            self.set_client_data(directory)
+            self.save_legacy_source(path)
+            self.update_actions()
+            if old_temp is not None:
+                old_temp.cleanup()
+
+        self.run_task("Opening client data…", read, loaded)
+
+    def legacy_open_directory(self):
+        if self.last_legacy_source is not None:
+            path = self.last_legacy_source
+            if path.is_dir():
+                return path
+            if path.parent.is_dir():
+                return path.parent
+        return Path.home()
+
+    def remember_legacy_source(self, path):
+        if not self.legacy or (self.client_data and path.is_relative_to(self.client_data)):
+            return
+        self.save_legacy_source(path)
+
+    def save_legacy_source(self, path):
+        self.last_legacy_source = path.resolve()
+        remember_path(self.settings, LEGACY_SOURCE_KEY, self.last_legacy_source, self.studio_dir)
+        self.save_workspace_settings()
+        self.reopen_legacy_action.setEnabled(self.task is None and self.last_legacy_source.exists())
+
+    def reopen_legacy(self):
+        if self.last_legacy_source is not None:
+            self.open_data_path(self.last_legacy_source)
+
+    def choose_binary_sdata(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open EP8 Client Table", str(self.legacy_open_directory()), "SData (*.sdata *.SData *.SDATA)",
+        )
+        if path:
+            self.open_binary_sdata(Path(path))
+
+    def open_binary_sdata(self, source):
+        if self.task is not None:
+            return
+        source = source.resolve()
+
+        def loaded(table):
+            self.remember_legacy_source(source)
+            self.update_actions()
+            dialog = BinaryTableDialog(source.name, table, self)
+            dialog.exec()
+            dialog.deleteLater()
+
+        self.run_task(f"Loading {source.name}…", lambda: BinarySData.open(source), loaded)
+
+    def read_client_catalog(self, path, parser):
+        if not self.legacy:
+            return parser.open(path)
+        name = next(name for name, catalog_type in TARGET_CATALOGS.items() if parser is catalog_type)
+        catalog, episode = inspect_catalog(name, read_file(path))
+        catalog.legacy_episode = episode
+        if episode == "8" and parser is NPCQuestCatalog:
+            translations = sorted((candidate for candidate in path.parent.iterdir()
+                                   if candidate.name.casefold().startswith("npcquesttrans")
+                                   and candidate.suffix.casefold() == ".sdata"),
+                                  key=lambda candidate: (candidate.name.casefold() != "npcquesttrans_usa.sdata",
+                                                         candidate.name.casefold()))
+            for translation in translations:
+                try:
+                    attach_ep8_quest_translation(catalog, translation.name, read_file(translation))
+                except (OSError, ValueError):
+                    continue
+                break
+            else:
+                catalog.legacy_text_status = " · No matching translation loaded"
+        if self.legacy_temp and path.resolve().is_relative_to(Path(self.legacy_temp.name)):
+            catalog.writable = False
+            catalog.archive_preview = True
+        return catalog
+
+    def choose_legacy_output(self, title, name):
+        path, _ = QFileDialog.getSaveFileName(self, title, str(Path.home() / name))
+        return Path(path) if path else None
+
+    def extract_legacy(self):
+        if self.task is not None or self.legacy_source is None:
+            return
+        destination = self.choose_legacy_output("Choose a New Extraction Folder", "legacy-data")
+        if destination:
+            source = self.legacy_source
+            working_directory = self.client_data
+            self.run_task("Extracting client data…",
+                          lambda: (LegacySource.open(working_directory) if source.archive else source).extract(destination),
+                          lambda count: self.statusBar().showMessage(f"Extracted {count:,} files to {destination}"))
+
+    def convert_legacy(self):
+        if self.task is not None:
+            return
+        source = self.legacy_source
+        detected_episode = self.legacy_episode
+        if source is not None:
+            inputs = [(entry.path, lambda entry=entry: source.read_catalog(entry, MAX_BYTES))
+                      for entry in source.entries if entry.path.name.casefold() in TARGET_CATALOGS]
+        else:
+            inputs = [(Path(path.name), lambda path=path: read_file(path)) for path in self.loaded_sdata()
+                      if path.name.casefold() in TARGET_CATALOGS]
+
+        def prepare():
+            results = []
+            for path, read in inputs:
+                try:
+                    raw = read()
+                    _, episode = inspect_catalog(path.name, raw)
+                    if episode == "8":
+                        raise ValueError("EP8 conversion to EP5.4 is unavailable.")
+                    episode = episode if episode in CONVERSION_EPISODES else detected_episode
+                    if episode not in CONVERSION_EPISODES:
+                        episode = "4.5"  # A validated shared layout needs only decryption.
+                    data, losses = convert_catalog(path.name, raw, episode)
+                except (OSError, ValueError) as error:
+                    results.append((path, None, str(error)))
+                else:
+                    detail = "\n".join(f"  {count:,} {label}" for label, count in losses.items())
+                    results.append((path, data, detail))
+            return results
+
+        self.run_task("Checking catalogs for EP5.4 conversion…", prepare, self.review_legacy_conversion)
+
+    def review_legacy_conversion(self, results):
+        converted = [(path, data) for path, data, _ in results if data is not None]
+        box = QMessageBox(self)
+        box.setWindowTitle("Convert to EP5.4 (GX)")
+        box.setText(f"{len(converted)} of {len(results)} catalogs can be written in GX EP5.4 format.")
+        box.setDetailedText("\n\n".join(f"{path}\n{detail or '  Ready for EP5.4'}" for path, _, detail in results))
+        if not converted:
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.exec()
+            return
+        if any(detail for _, _, detail in results):
+            box.setInformativeText("Show Details lists values that will change and catalogs that could not be converted.")
+        save = box.addButton("Choose Output Folder…", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        if box.clickedButton() != save:
+            return
+        destination = self.choose_legacy_output("Choose a New EP5.4 Output Folder", "gx-ep5.4")
+        if destination:
+            source = self.legacy_source
+
+            def write():
+                if source is not None:
+                    source.validate_destination(destination)
+                with new_output_folder(destination) as staging:
+                    for relative, data in converted:
+                        output = staging / relative
+                        output.parent.mkdir(parents=True, exist_ok=True)
+                        with output.open("xb") as file:
+                            file.write(data)
+
+            self.run_task("Writing EP5.4 catalogs…", write,
+                          lambda _: self.statusBar().showMessage(f"Saved {len(converted)} catalogs to {destination}"))
 
     def configure_workspace(self, focus="client"):
         if self.task is None:
@@ -912,19 +1281,24 @@ class Window(QMainWindow):
                 or self.find_client_models(candidate) or self.has_client_model_tables(candidate)
             ):
                 return candidate.resolve()
-        raise ValueError("Select a Shaiya GX client install folder or its data folder with supported client files.")
+        client = "Shaiya" if self.legacy else "Shaiya GX"
+        raise ValueError(f"Select a {client} client install folder or its data folder with supported client files.")
 
     def choose_workspace(self):
         if self.task is not None:
             return
-        initial = self.client_data if self.client_data and self.client_data.is_dir() else Path.home()
+        initial = (self.legacy_open_directory() if self.legacy else
+                   self.client_data if self.client_data and self.client_data.is_dir() else Path.home())
         path = QFileDialog.getExistingDirectory(self, "Select Client Data Folder", str(initial))
         if not path:
+            return
+        if self.legacy:
+            self.open_legacy_client(Path(path))
             return
         try:
             directory = self.resolve_client_data(Path(path))
         except (OSError, RuntimeError, ValueError) as error:
-            QMessageBox.warning(self, "Open Workspace", str(error))
+            QMessageBox.warning(self, "Open Client Data" if self.legacy else "Open Workspace", str(error))
             return
         if directory == self.client_data or self.confirm_discard():
             self.set_client_data(directory)
@@ -1030,6 +1404,7 @@ class Window(QMainWindow):
             self.mlt_window.clear()
             self.client_model_window.clear()
             self.monster_window.clear()
+            self.asset_window.clear()
             self.asset_window.close()
             self.workspace = None
         self.client_data = directory
@@ -1038,8 +1413,9 @@ class Window(QMainWindow):
         self.client_skills = self.find_client_skills(directory)
         self.client_npc_skills = self.find_client_skills(directory, npc=True)
         self.client_quests = self.find_client_npcquest(directory)
-        remember_path(self.settings, CLIENT_ROOT_KEY, directory, self.studio_dir)
-        self.save_workspace_settings()
+        if not self.legacy:
+            remember_path(self.settings, CLIENT_ROOT_KEY, directory, self.studio_dir)
+            self.save_workspace_settings()
         self.populate_tree()
         self.update_actions()
 
@@ -1049,32 +1425,32 @@ class Window(QMainWindow):
             QMessageBox.warning(self, "Workspace Settings", f"Could not save the workspace settings in\n{self.settings.fileName()}")
 
     def choose_source(self):
-        initial = str(self.client_data) if self.client_data else ""
+        initial = str(self.legacy_open_directory()) if self.legacy else str(self.client_data or "")
         path, _ = QFileDialog.getOpenFileName(self, "Open Item.SData", initial, "SData (*.sdata *.SData);;All Files (*)")
         if path:
             self.open_catalog(Path(path))
 
     def choose_cash_source(self):
-        initial = str(self.client_data) if self.client_data else ""
+        initial = str(self.legacy_open_directory()) if self.legacy else str(self.client_data or "")
         path, _ = QFileDialog.getOpenFileName(self, "Open Cash.SData", initial, "SData (*.sdata *.SData)")
         if path:
             self.open_cash(Path(path))
 
     def choose_skill_source(self, *, npc: bool = False):
-        initial = str(self.client_data) if self.client_data else ""
+        initial = str(self.legacy_open_directory()) if self.legacy else str(self.client_data or "")
         filename = NPCSkillCatalog.filename if npc else SkillCatalog.filename
         path, _ = QFileDialog.getOpenFileName(self, f"Open {filename}", initial, "SData (*.sdata *.SData)")
         if path:
             self.open_skills(Path(path), npc=npc)
 
     def choose_npcquest_source(self):
-        initial = str(self.client_data) if self.client_data else ""
+        initial = str(self.legacy_open_directory()) if self.legacy else str(self.client_data or "")
         path, _ = QFileDialog.getOpenFileName(self, "Open Client NpcQuest.SData", initial, "SData (*.sdata *.SData)")
         if path:
             self.open_npcquest(Path(path))
 
     def choose_mon_source(self):
-        initial = str(self.client_data) if self.client_data else ""
+        initial = str(self.legacy_open_directory()) if self.legacy else str(self.client_data or "")
         path, _ = QFileDialog.getOpenFileName(self, "Open MON Model Table", initial, "MON files (*.mon *.MON)")
         if path:
             self.open_mon(Path(path))
@@ -1153,14 +1529,12 @@ class Window(QMainWindow):
             QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
         ) != QMessageBox.StandardButton.Discard:
             return
-        database = self.connection.path if self.connection.connected else (
-            self.manual_database.resolve() if self.manual_database else None
-        )
+        database = self.connection.path if self.connection.connected else None
         workspace = self.client_data
         selected = editor.selected()
 
         def read():
-            catalog = MonsterCatalog.open(source)
+            catalog = self.read_client_catalog(source, MonsterCatalog)
             model_path = find_child(source.parent, "monster.MON")
             if not model_path.is_file() and workspace is not None:
                 model_path = find_child(find_child(workspace, "Monster"), "monster.MON")
@@ -1186,6 +1560,7 @@ class Window(QMainWindow):
                 editor.refresh(selected)
             else:
                 editor.load(source, catalog, folder, models, database if not status else None, rows, drops, status, references)
+            self.remember_legacy_source(source)
             self.update_catalog_nodes()
             self.show_editor(editor)
             if editor.database is None and not editor.database_status:
@@ -1196,7 +1571,7 @@ class Window(QMainWindow):
     def monster_references(self, folder, workspace):
         skill_names, grades = {}, {}
         try:
-            skills = NPCSkillCatalog.open(find_child(folder, "NpcSkill.SData"))
+            skills = self.read_client_catalog(find_child(folder, "NpcSkill.SData"), NPCSkillCatalog)
             for identifier in sorted(skills.records):
                 skill_names.setdefault(identifier[0], str(skills.value(identifier, SKILL_FIELDS_BY_NAME["Name"])))
         except (OSError, ValueError):
@@ -1204,7 +1579,7 @@ class Window(QMainWindow):
         try:
             items_source = self.find_client_catalog(workspace)
             if items_source is not None:
-                catalog = Catalog.open(items_source)
+                catalog = self.read_client_catalog(items_source, Catalog)
                 for item_id, item in catalog.items.items():
                     grade = catalog.value(item, FIELDS_BY_NAME["Grade"])
                     if grade:
@@ -1215,22 +1590,36 @@ class Window(QMainWindow):
 
     def choose_asset_source(self):
         initial = str(self.asset_window.source.parent if self.asset_window.source else self.client_data or "")
-        path, _ = QFileDialog.getOpenFileName(self, "Open GX Asset", initial, ASSET_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "Open Client Asset" if self.legacy else "Open GX Asset", initial, ASSET_FILTER)
+        if path:
+            self.open_asset(Path(path))
+
+    def choose_server_map(self):
+        if self.task is not None or self.legacy:
+            return
+        initial = find_child(self.server_data, "maps") if self.server_data else Path.home()
+        path, _ = QFileDialog.getOpenFileName(self, "Open Server Map", str(initial), "Server Map (*.svmap *.SVMAP)")
         if path:
             self.open_asset(Path(path))
 
     def open_asset(self, source: Path):
         if self.task is not None:
             return
-        source = source.absolute()
+        source = source.resolve()
         viewer = self.asset_window
+        if viewer.source == source and viewer.mode == "server_map":
+            self.show_editor(viewer)
+            return
+        if not viewer.confirm_discard():
+            return
         workspace = self.client_data
 
         def loaded(document):
             viewer.load(source, document)
             self.show_editor(viewer)
 
-        self.run_task("Opening asset…", lambda: read_document(source, workspace), loaded)
+        server_data = self.server_data
+        self.run_task("Opening asset…", lambda: read_document(source, workspace, server_data), loaded)
 
     def open_model_table(self, source: Path, *, reload=False, kind=None):
         if self.task is not None:
@@ -1274,13 +1663,14 @@ class Window(QMainWindow):
         target = self.quest_server_target(source)
 
         def read():
-            client = NPCQuestCatalog.open(source)
+            client = self.read_client_catalog(source, NPCQuestCatalog)
             return client, self.read_quest_server(source, target)
 
         def loaded(result):
             client, (server_path, server, failure) = result
             self.quest_link_path = target
             editor.load(source, client, server_path, server, failure)
+            self.remember_legacy_source(source.resolve())
             self.update_catalog_nodes()
             self.show_editor(editor)
 
@@ -1292,6 +1682,8 @@ class Window(QMainWindow):
         return f"{QUEST_SERVER_KEY}/{root.as_posix()}"
 
     def quest_server_target(self, source: Path) -> Path | None:
+        if self.legacy:
+            return None
         if source == self.client_quests and (self.server_folder or self.server_data):
             return self.workspace_server_quest()
         return workspace_path(self.settings, self.quest_server_key(source), self.studio_dir)
@@ -1378,6 +1770,7 @@ class Window(QMainWindow):
         title = "Install NpcQuest Rules" if full else "Save NpcQuest"
         text = "Save the pending client edits and install every NPC, quest rule and item link on the server?" if full else (
             "Save the client edits and apply the changed gameplay rules to the linked server file?" if server else
+            "Save changes to the client file?" if self.legacy else
             "Save changes to the client file only? Select a server file to synchronize gameplay changes."
         )
         confirmation = QMessageBox(QMessageBox.Icon.Question, title, "", parent=editor)
@@ -1444,10 +1837,11 @@ class Window(QMainWindow):
             if not find_child(data, "interface").is_dir() and self.client_data:
                 data = self.client_data
             self.cash_window.load(source, catalog, data, database)
+            self.remember_legacy_source(source.resolve())
             self.update_catalog_nodes()
             self.show_cash()
 
-        self.run_task("Loading Cash.SData…", lambda: CashCatalog.open(source), loaded)
+        self.run_task("Loading Cash.SData…", lambda: self.read_client_catalog(source, CashCatalog), loaded)
 
     def show_cash(self):
         self.show_editor(self.cash_window)
@@ -1488,10 +1882,11 @@ class Window(QMainWindow):
             if not find_child(data, "interface").is_dir() and self.client_data:
                 data = self.client_data
             editor.load(source, catalog, data, database)
+            self.remember_legacy_source(source.resolve())
             self.update_catalog_nodes()
             self.show_editor(editor)
 
-        self.run_task(f"Loading {editor.filename}…", lambda: editor.catalog_type.open(source), loaded)
+        self.run_task(f"Loading {editor.filename}…", lambda: self.read_client_catalog(source, editor.catalog_type), loaded)
 
     def reload_skills(self, editor: SkillWindow | None = None):
         editor = editor or self.skill_window
@@ -1566,8 +1961,11 @@ class Window(QMainWindow):
                     self.sqlite_window.path.setText(f"{result.status} · {result.path}")
         self.update_actions()
         editor = self.monster_window
-        if changed and editor.isVisible() and editor.database is None and not editor.database_status:
-            editor.reload_sqlite()
+        if changed and editor.source is not None:
+            editor.refresh(editor.selected())
+            if (editor.isVisible() and result.connected and not editor.sqlite_loaded()
+                    and not editor.sql_edits and not editor.drop_edits):
+                editor.reload_sqlite()
         self.refresh_quest_link()
 
     @Slot(str)
@@ -1705,13 +2103,14 @@ class Window(QMainWindow):
                 ).is_dir()
                 self.data_root = source_root if has_models or self.client_data is None else self.client_data
             self.item_window.load_workspace(workspace)
+            self.remember_legacy_source(source.resolve())
             self.update_catalog_nodes()
             if show_items:
                 self.show_catalog()
             if on_loaded is not None:
                 on_loaded(workspace)
 
-        self.run_task("Loading Item.SData…", lambda: Workspace(source, database), loaded)
+        self.run_task("Loading Item.SData…", lambda: Workspace(source, database, read_catalog=lambda path: self.read_client_catalog(path, Catalog)), loaded)
 
     def run_task(self, message, operation, on_success):
         self.task = Task(operation)
@@ -1979,7 +2378,7 @@ class Window(QMainWindow):
             for name, value in changes.items():
                 field = SKILL_FIELDS_BY_NAME[name]
                 before = editor.catalog.value((skill_id, rank), field)
-                suffix = f" · SQLite {field.column}" if field.column else ""
+                suffix = f" · SQLite {field.column}" if database and field.column else ""
                 lines.append(f"{skill_id}/{rank}  {field.label}: {before!r} → {value!r}{suffix}")
         preview = QPlainTextEdit("\n".join(lines))
         preview.setReadOnly(True)
@@ -2026,7 +2425,12 @@ class Window(QMainWindow):
     def close_current_workspace(self):
         if self.task is not None or not self.confirm_discard():
             return
+        self.legacy_source = self.legacy_episode = None
+        self.legacy_layouts = {}
         self.set_client_data(None)
+        if self.legacy_temp is not None:
+            self.legacy_temp.cleanup()
+            self.legacy_temp = None
 
     def closeEvent(self, event: QCloseEvent):
         if self.task is not None or not self.confirm_discard():
@@ -2048,15 +2452,32 @@ class Window(QMainWindow):
             self.mlt_window.close()
             self.client_model_window.close()
             self.monster_window.close()
+            self.asset_window.clear()
             self.asset_window.close()
             self.sqlite_window.close()
+            if self.legacy_temp is not None:
+                self.legacy_temp.cleanup()
+                self.legacy_temp = None
             event.accept()
+
+
+def choose_work_mode():
+    dialog = QMessageBox()
+    dialog.setWindowTitle("GX Studio")
+    dialog.setText("Which data do you want to work with?")
+    gx = dialog.addButton("GX", QMessageBox.ButtonRole.AcceptRole)
+    legacy = dialog.addButton("Legacy Data", QMessageBox.ButtonRole.ActionRole)
+    dialog.addButton(QMessageBox.StandardButton.Cancel)
+    dialog.setDefaultButton(gx)
+    dialog.exec()
+    return {gx: "gx", legacy: "legacy"}.get(dialog.clickedButton())
 
 
 def main() -> int:
     parser = ArgumentParser(description="GX Studio data editor and asset viewer")
     parser.add_argument("catalog", type=Path, nargs="?")
     parser.add_argument("--sqlite", type=Path)
+    parser.add_argument("--mode", choices=("gx", "legacy"))
     parser.add_argument("--check-startup", action="store_true", help="Open the workspace briefly to verify a build.")
     arguments = parser.parse_args()
     app = QApplication([])
@@ -2065,29 +2486,15 @@ def main() -> int:
     app.setDesktopFileName("gx-data-editor")
     app.setWindowIcon(QIcon(str(APP_ICON)))
     set_light_theme(app)
-    window = Window(arguments.sqlite)
+    mode = arguments.mode or ("gx" if arguments.check_startup else choose_work_mode())
+    if mode is None:
+        return 0
+    window = Window(arguments.sqlite, legacy=mode == "legacy")
     window.show()
     if arguments.check_startup:
-        QTimer.singleShot(300, app.quit)
+        QTimer.singleShot(300, app.exit)
     if arguments.catalog:
-        if arguments.catalog.name.casefold() == "cash.sdata":
-            window.open_cash(arguments.catalog, arguments.sqlite)
-        elif arguments.catalog.name.casefold() == "skill.sdata":
-            window.open_skills(arguments.catalog, arguments.sqlite)
-        elif arguments.catalog.name.casefold() == "npcskill.sdata":
-            window.open_skills(arguments.catalog, arguments.sqlite, npc=True)
-        elif arguments.catalog.name.casefold() == "npcquest.sdata":
-            window.open_npcquest(arguments.catalog)
-        elif arguments.catalog.name.casefold() == "monster.sdata":
-            window.open_monsters(arguments.catalog)
-        elif client_model_type(arguments.catalog) is not None:
-            window.open_client_model(arguments.catalog)
-        elif arguments.catalog.suffix.casefold() in MODEL_EDITORS:
-            window.open_model_table(arguments.catalog)
-        elif arguments.catalog.suffix.casefold() in ASSET_EXTENSIONS:
-            window.open_asset(arguments.catalog)
-        else:
-            window.load(arguments.catalog, arguments.sqlite)
+        window.open_data_path(arguments.catalog, arguments.sqlite)
     result = app.exec()
     QThreadPool.globalInstance().waitForDone()
     return result

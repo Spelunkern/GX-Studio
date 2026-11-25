@@ -3,6 +3,7 @@ import sys
 
 from PySide6.QtCore import QSettings, QStandardPaths
 
+LEGACY_SOURCE_KEY = "legacy/lastData"
 CLIENT_ROOT_KEY = "workspace/clientData"
 SERVER_FOLDER_KEY = "workspace/serverFolder"
 DATABASE_KEY = "workspace/database"

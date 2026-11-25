@@ -38,6 +38,13 @@ def file_envelope(path: Path, *, known: bool = True) -> str:
         return "Unavailable"
 
 
+def episode_label(catalog, *, canonical=False) -> str:
+    """Label a validated EP5 catalog and mark the standard GX file formats."""
+    if canonical or (catalog is not None and catalog.writable):
+        return 'EP5.4 <span style="color:#b7f0bc; background-color:#30583a;">(GX)</span>'
+    return "EP5" if catalog is not None else ""
+
+
 def _substitute(word: np.ndarray) -> np.ndarray:
     a, b, c, d = SBOX_ARRAYS
     return a[word & 255] ^ b[(word >> 8) & 255] ^ c[(word >> 16) & 255] ^ d[word >> 24]
@@ -63,18 +70,28 @@ def _transform(data: bytes, decrypt: bool) -> bytes:
     return bytes(output)
 
 
-def decode(raw: bytes) -> tuple[bytes, bool]:
+def decode(raw: bytes, *, binary=False) -> tuple[bytes, bool]:
     if not raw.startswith(SIGNATURE):
         return raw, True
     if len(raw) < HEADER_SIZE or len(raw) % BLOCK.size:
         raise ValueError("The encryption header is incomplete.")
     checksum, size, alternate_size = unpack_from("<III", raw, 40)
     if not checksum:
+        if binary:
+            checksum = size
         size = alternate_size
     if not 0 < size <= len(raw) - HEADER_SIZE:
         raise ValueError("The encryption header declares an invalid size.")
     plain = _transform(raw[HEADER_SIZE:], decrypt=True)[:size]
     if checksum and crc32(plain) != checksum:
+        if binary:
+            # Some BinarySData envelopes include zero alignment bytes in the declared length.
+            end = len(plain)
+            minimum = max(1, end - (BLOCK.size - 1))
+            while end > minimum and plain[end - 1] == 0:
+                end -= 1
+                if crc32(memoryview(plain)[:end]) == checksum:
+                    return plain[:end], True
         raise ValueError("The encrypted file checksum is incorrect.")
     return plain, bool(checksum)
 

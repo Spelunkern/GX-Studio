@@ -76,7 +76,7 @@ FIELDS = (
             "Reqluc" if stat == "Luc" else "Req" + stat, None if stat == "Luc" else 32767)
       for i, stat in enumerate(STATS)),
     Field("ReqVG", "VG parameter", REQUIREMENTS, 28, 2, "ReqVg", 32767),
-    Field("ReqOG", "Guild bank restriction", REQUIREMENTS, 30, 1, "ReqOg"),
+    Field("ReqOG", "Character restrictions", REQUIREMENTS, 30, 1, "ReqOg"),
     Field("ReqIg", "IG parameter", REQUIREMENTS, 31, 1, "ReqIg"),
     Field("Range", "Range / low byte of skill ID", COMBAT, 32, 1, "Range"),
     Field("AttackTime", "Attack tier / skill level", COMBAT, 33, 1, "AttackTime"),

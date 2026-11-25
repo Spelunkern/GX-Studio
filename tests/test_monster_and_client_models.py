@@ -8,7 +8,7 @@ import unittest
 
 from gx_items.asset_view import read_document
 from gx_items.client_model_data import AltCatalog, CloakCatalog, EmblemCatalog, TextureCatalog
-from gx_items.monster_data import CLIENT_BY_KEY, DB_FIELDS, DROPS, TABLE, MonsterCatalog, U32, read_mobs, read_monster_db, save_mobs
+from gx_items.monster_data import CLIENT_BY_KEY, DB_FIELDS, DROPS, TABLE, MonsterCatalog, U32, plan_client_import, read_mobs, read_monster_db, save_mobs
 from gx_items.workspace import quote
 
 
@@ -27,6 +27,18 @@ class MonsterAndClientModelsTest(unittest.TestCase):
                 catalog.encode({1: {"HP": value}})
         with self.assertRaises(ValueError):
             CLIENT_BY_KEY["Day"].parse(7)
+
+    def test_client_import_maps_only_shared_fields_and_reports_unrepresentable_values(self):
+        name = b"Local"
+        record = pack("<I", len(name)) + name + bytes(31)
+        catalog = MonsterCatalog(pack("<I", 2) + record * 2)
+        server = {"MobName": "Server", **{key: value for key, value in catalog.row(1).items() if key != "Name"},
+                  "Level": 8, "NormalStep": 300, "Day": 3, "AttackType1": 9, "HP": 500}
+        changes, skipped = plan_client_import(catalog, {1: {"Level": 8}}, {1: server, 3: server}, (1, 3))
+        self.assertEqual(changes, [(1, "HP", 0, 500)])
+        self.assertEqual(skipped[0][:3], (1, "Walk step", 300))
+        changes, _ = plan_client_import(catalog, {}, {1: server}, (1,), include_names=True)
+        self.assertIn((1, "Name", "Local", "Server"), changes)
 
     def test_sqlite_changes_are_keyed_and_dated_backup_contains_previous_values(self):
         with TemporaryDirectory() as tmp:

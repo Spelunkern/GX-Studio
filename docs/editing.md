@@ -91,13 +91,19 @@ encryption and rule differences before saving.
 
 ## Monsters
 
-Double-click a monster to open the compact record view. Blue controls show
-SQLite-backed fields. Focusing a field shows the source, native name and
-editable range. **Source Values…** exposes the remaining client and server
-fields. The model button opens the preview. **Drops >>** shows the nine
+Double-click a monster to open the compact record view. SQLite values
+appear in green and turn red when a corresponding client value differs.
+Client values use the regular text color. Focusing a field shows its source,
+native name, editable range, and comparison. **More Monster Fields…**
+exposes the remaining client and server fields. The model button opens the preview. **Drops >>** shows the nine
 drop slots and the client items in the selected grade. Slots 1–6 use integer
 percentages, and slots 7–9 accept 0.0001% increments. Native limits include
 4,294,967,295 HP and 255 UTF-8 bytes for a client monster name.
+
+**Tools → Import SQLite Values…** previews an import for one MobID or all
+matching MobIDs. It uses the saved SQLite values and skips values outside
+the client field's range. Localized names are optional. **Save Client
+Monster.SData…** writes staged changes with a backup.
 
 ## Models, effects and other assets
 
@@ -119,7 +125,12 @@ percentages, and slots 7–9 accept 0.0001% increments. Native limits include
   sequence information is present. The component selector isolates
   emitters. Previews bound drawing work for responsiveness.
 
-This beta omits `.wld` and `.svmap` editing and viewing, portions of GX
+The `.svmap` editor supports drawn and manual monster areas, selecting
+monsters by name, and moving spawn boxes from the minimap. Save map
+placements with **Save Server Map**. Save the current map's safe zones
+separately with **Save SafeZones.INI**. Both saves create dated backups.
+
+This beta omits full `.wld` editing and viewing, portions of GX
 World’s server-only catalog formats, and the locked Pets, Wings and Costumes
 item sections. A source with an unrecognized layout may be unavailable for
 editing. Keep the original files to compare results during beta testing.

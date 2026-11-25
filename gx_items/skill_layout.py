@@ -44,7 +44,7 @@ COMBOS = {field: dict(enumerate(options)) for field, options in {
     "TargetType": ("Default", "Field Trap", "Caster", "Selected target", "Party", "Party / nearby allies",
                    "Enemies near caster", "Enemies near target / selected ally", "Raid (healing or buff)"),
     "AttrType": ELEMENTS,
-    "StateType": ("None", "Sleep", "Stun", "Darkness", "Silence", "Immobilize", "Slow", "Flat Damage",
+    "StateType": ("None", "Sleep", "Stun", "Silence", "Darkness", "Immobilize", "Slow", "Flat Damage",
                   "Death's Touch", "HP damage over time", "SP damage over time", "MP damage over time",
                   "Mental Smasher", "Lower Attack or Defense", "Slump Shot", "Misfortunate"),
     "FixRange": ("Seconds", "Hours / persists on death", "Seconds / persists on death"),

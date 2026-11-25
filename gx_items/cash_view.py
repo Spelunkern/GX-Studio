@@ -213,7 +213,7 @@ class CashProductDialog(QDialog):
         self.browse.setEnabled(editable and bool(items))
         self.browse.clicked.connect(self.pick_item)
         if not items:
-            self.browse.setToolTip("Open a workspace with Item.SData or connect to GX SQLite.")
+            self.browse.setToolTip("Open client data with Item.SData.")
         picker.addWidget(QLabel("Item slot:"))
         picker.addWidget(self.slot)
         picker.addWidget(self.browse)
@@ -297,6 +297,7 @@ class CashWindow(QMainWindow):
         file_menu.addAction("&Close", "Ctrl+W", self.close)
         self.save = file_menu.addAction("&Save", "Ctrl+S", studio.review_cash)
         self.install = file_menu.addAction("&Install…", studio.install_cash)
+        self.install.setVisible(not studio.legacy)
         self.reload = file_menu.addAction("&Reload…", studio.reload_cash)
         edit = self.menuBar().addMenu("&Edit")
         self.new_product = edit.addAction("New Product…", "Ctrl+N", self.add_product)
@@ -399,7 +400,7 @@ class CashWindow(QMainWindow):
             self.model.set_products(self.rows, self.tabs.tabData(current), self.icons)
         name = self.source.name if self.source else "Cash.SData"
         self.setWindowTitle(f"{name}{' *' if self.changed() else ''}")
-        format_note = "    Encrypted (read-only)" if self.catalog and not self.catalog.writable else ""
+        format_note = "    Read-only" if self.catalog and not self.catalog.writable else ""
         self.statusBar().showMessage(f"{len(self.model.rows)} products{format_note}")
         self.update_actions()
 

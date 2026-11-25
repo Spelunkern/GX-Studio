@@ -123,7 +123,7 @@ DB_FIELDS = (
         MobField(f"Attackattrib{n}", "Attack element" if n < 3 else "Faction", f"Attack {n}",
                  4 if n < 3 else 2, choices=ELEMENTS if n < 3 else ("None", "Light", "Fury")),
         MobField(f"Attackok{n}", "Activation condition", f"Attack {n}", 6, choices=CONDITIONS),
-        MobField(f"Attackspecial{n}", "Legacy special code" if n < 3 else "Respawn delay", f"Attack {n}",
+        MobField(f"Attackspecial{n}", "Legacy special code" if n < 3 else "Respawn Time", f"Attack {n}",
                  U8 if n < 3 else 15, choices=() if n < 3 else RESPAWNS, read_only=n < 3),
     )),
     *(MobField(f"ResistState{i}", f"State {i}", "Immunities", 1, choices=("Off", "Immune")) for i in range(1, 16)),
@@ -131,6 +131,40 @@ DB_FIELDS = (
 )
 CLIENT_BY_KEY = {field.key: field for field in CLIENT_FIELDS}
 DB_BY_KEY = {field.key: field for field in DB_FIELDS}
+
+
+# Identical column names alone do not imply identical client and server semantics.
+SYNC_FIELDS = {
+    "Name": "MobName",
+    **{key: key for key in (
+        "Level", "AI", "HP", "Size", "Attrib", "NormalTime", "NormalStep", "ChaseTime", "ChaseStep", "QuestItemID",
+    )},
+}
+SYNC_BY_SQL = {sql: client for client, sql in SYNC_FIELDS.items()}
+
+
+def plan_client_import(catalog, staged, rows, mob_ids, *, include_names=False):
+    changes, skipped = [], []
+    for mob_id in mob_ids:
+        if not 1 <= mob_id < len(catalog.records) or mob_id not in rows:
+            continue
+        client = catalog.row(mob_id) | staged.get(mob_id, {})
+        server = rows[mob_id]
+        for key, sql_key in SYNC_FIELDS.items():
+            if key == "Name" and not include_names:
+                continue
+            before, stored = client[key], server.get(sql_key)
+            if before == stored:
+                continue
+            field = CLIENT_BY_KEY[key]
+            try:
+                after = field.parse(stored)
+            except ValueError:
+                skipped.append((mob_id, field.label, stored, field.range_text))
+                continue
+            if after != before:
+                changes.append((mob_id, key, before, after))
+    return changes, skipped
 
 
 class MonsterCatalog:

@@ -1,50 +1,107 @@
 """Read-only windows for GX meshes, textures, animations and media."""
 
-from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 
-from PIL import Image
+from PIL.Image import DecompressionBombError
 
 from PySide6.QtCore import QSignalBlocker, QSize, Qt, QUrl
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QMainWindow, QPushButton, QScrollArea, QSizePolicy,
-    QSlider, QStackedWidget, QVBoxLayout, QWidget,
+    QMessageBox, QSlider, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from .asset_models import (
-    ASSET_EXTENSIONS, FONT_EXTENSIONS, IMAGE_EXTENSIONS, MODEL_EXTENSIONS, cloth_texture_paths,
+    ASSET_EXTENSIONS, AUDIO_EXTENSIONS, FONT_EXTENSIONS, IMAGE_EXTENSIONS, MODEL_EXTENSIONS, cloth_texture_paths,
     effect_components, open_model,
 )
 from .catalog import decode_text
 from .client_model_data import EMBLEM_FILTER, EmblemCatalog, emblem_texture_directory
 from .equipment_models import ModelAssets, basename, dds_name
 from .equipment_preview import AnimatedPreview
+from .image_assets import read_image
+from .mon_catalog import MonCatalog
+from .monster_data import MonsterCatalog
+from .npcquest_data import NPCQuestCatalog
+from .install import save_model_table
+from .safe_zones import SafeZones, check_map_config
+from .svmap import ServerMap, read_area_text, read_world_area_names
+from .svmap_view import ServerMapView
 
-ASSET_FILTER = ("GX assets (" + " ".join(f"*{ext} *{ext.upper()}" for ext in sorted(ASSET_EXTENSIONS))
+ASSET_FILTER = ("Client assets (" + " ".join(f"*{ext} *{ext.upper()}" for ext in sorted(ASSET_EXTENSIONS))
                 + f" {EMBLEM_FILTER})")
 
 
-@dataclass(frozen=True, slots=True)
-class ImageData:
-    pixels: bytes
-    width: int
-    height: int
-    description: str
+def server_map_assets(source, workspace):
+    if workspace is None or not (source.stem.isascii() and source.stem.isdecimal()):
+        return None, {}, {}, (), (None, ())
+    map_id = int(source.stem)
+    assets = ModelAssets(workspace)
+    minimap = None
+    for filename in (f"minimap_{map_id}.png", f"minimap_{map_id}.tga", f"{map_id}.png", f"{map_id}.tga"):
+        if (path := assets.resolve(f"interface/minimap/{filename}")) is not None:
+            try:
+                minimap = read_image(path)
+            except (OSError, ValueError, DecompressionBombError):
+                continue
+            break
+    monsters, npcs = {}, {}
+    try:
+        if (path := assets.resolve("monster/Monster.SData")) is not None:
+            catalog = MonsterCatalog.open(path)
+            monsters = {number: catalog.row(number) for number in range(len(catalog.records))}
+    except (OSError, ValueError):
+        pass
+    try:
+        if (path := assets.resolve("npc/NpcQuest.SData")) is not None:
+            npcs = NPCQuestCatalog.open(path).data.npcs
+    except (OSError, ValueError):
+        pass
+    models = ()
+    model_assets = None
+    try:
+        if (path := assets.resolve("monster/Monster.MON")) is not None:
+            models = MonCatalog.open(path).records
+            model_assets = ModelAssets(path.parent)
+    except (OSError, ValueError):
+        pass
+    areas = ()
+    try:
+        if assets.resolve(f"world/{map_id}.wld") is not None:
+            localized = read_area_text(assets.read(f"world/{map_id}.txt")) if assets.resolve(f"world/{map_id}.txt") else {}
+
+            def banner_file(stem):
+                return next((path for extension in ("png", "tga", "dds")
+                             if assets.resolve(path := f"interface/worldname/{stem}.{extension}") is not None),
+                            f"interface/worldname/{stem}.png")
+
+            areas = read_world_area_names(assets.read(f"world/{map_id}.wld"), localized, map_id, banner_file)
+    except (OSError, ValueError):
+        pass
+    return minimap, monsters, npcs, areas, (model_assets, models)
 
 
-def read_image(source):
-    with Image.open(source) as image:
-        width, height = image.size
-        if width * height > 32_000_000:
-            raise ValueError("The image exceeds 32 million pixels.")
-        label = f"{width:,} × {height:,}  ·  {image.format}  ·  {image.mode}"
-        return ImageData(image.convert("RGBA").tobytes(), width, height, label)
+def server_safe_zones(source, server_data):
+    if not (source.stem.isascii() and source.stem.isdecimal() and int(source.stem) <= 65535):
+        return None, None, "A numeric server map ID is required."
+    roots = (source.parent.parent, server_data)
+    for root in roots:
+        if root is not None and (path := ModelAssets(root).resolve("game/SafeZones.INI")) is not None:
+            try:
+                check_map_config(path, int(source.stem))
+                return path, SafeZones.open(path), ""
+            except (OSError, ValueError) as error:
+                return path, None, str(error)
+    return None, None, "Server game/SafeZones.INI is unavailable."
 
 
-def read_document(source, workspace):
+def read_document(source, workspace, server_data=None):
     ext = source.suffix.casefold()
+    if ext == ".svmap":
+        data = ServerMap.open(source)
+        return "server_map", (data, *server_map_assets(source, workspace), server_safe_zones(source, server_data),
+                              int(source.stem) if source.stem.isascii() and source.stem.isdecimal() else None)
     if folder := emblem_texture_directory(source):
         assets = ModelAssets(source.parent)
         return "textures", tuple(
@@ -60,7 +117,7 @@ def read_document(source, workspace):
         return "textures", cloth_texture_paths(source, workspace)
     if ext in FONT_EXTENSIONS:
         return "font", source
-    if ext == ".ogg":
+    if ext in AUDIO_EXTENSIONS:
         if not source.is_file():
             raise FileNotFoundError(source.name)
         return "audio", source
@@ -149,8 +206,7 @@ class ImageView(QScrollArea):
     def set_image(self, data):
         self.canvas.pixmap = QPixmap()
         if data is not None:
-            image = QImage(data.pixels, data.width, data.height, data.width * 4, QImage.Format.Format_RGBA8888)
-            self.canvas.pixmap = QPixmap.fromImage(image)
+            self.canvas.pixmap = data.pixmap()
         self.fit_image()
 
     def set_zoom(self, zoom):
@@ -270,6 +326,7 @@ class AssetWindow(QMainWindow):
         super().__init__(studio, Qt.WindowType.Window)
         self.setWindowTitle("Asset Viewer")
         self.resize(740, 545)
+        self.studio = studio
         self.settings = studio.settings
         self.source = None
         self.variants = ()
@@ -277,7 +334,12 @@ class AssetWindow(QMainWindow):
         self.mode = ""
         self.font_id = -1
         self.audio = None
-        self.menuBar().addMenu("&File").addAction("&Close", "Ctrl+W", self.close)
+        menu = self.menuBar().addMenu("&File")
+        self.save_map = menu.addAction("&Save Server Map", "Ctrl+S", self.save_server_map)
+        self.save_map.setVisible(False)
+        self.save_zones = menu.addAction("Save SafeZones.INI", "Ctrl+Shift+S", self.save_safe_zones)
+        self.save_zones.setVisible(False)
+        menu.addAction("&Close", "Ctrl+W", self.close)
         body = QWidget()
         layout = QVBoxLayout(body)
         controls = QHBoxLayout()
@@ -307,13 +369,16 @@ class AssetWindow(QMainWindow):
         layout.addWidget(self.pages, 1)
         self.model = AssetPreview(self)
         self.images = ImageView()
+        self.server_map = ServerMapView(self)
+        self.server_map.edited.connect(self.update_map_status)
+        self.server_map.save_zones_requested.connect(self.save_safe_zones)
         self.font_sample = QLabel(
             "ABCDEFGHIJKLMNOPQRSTUVWXYZ\nabcdefghijklmnopqrstuvwxyz\n0123456789  ÁÉÍÓÚ  Ññ  ¿¡  €\n"
             "The quick brown fox jumps over the lazy dog."
         )
         self.font_sample.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.font_sample.setWordWrap(True)
-        for widget in (self.model, self.images, self.font_sample):
+        for widget in (self.model, self.images, self.font_sample, self.server_map):
             self.pages.addWidget(widget)
         self.setCentralWidget(body)
 
@@ -321,6 +386,8 @@ class AssetWindow(QMainWindow):
         self.clear()
         self.source = source
         self.mode, data = document
+        if self.mode == "server_map" and not self.isMaximized():
+            self.resize(max(self.width(), 995), max(self.height(), 565))
         self.setWindowTitle(source.name + " · Asset Viewer")
         self.zoom.setVisible(self.mode in ("image", "textures", "model"))
         with QSignalBlocker(self.zoom):
@@ -329,6 +396,10 @@ class AssetWindow(QMainWindow):
         if self.mode == "model":
             self.pages.setCurrentWidget(self.model)
             self.model.renderer, self.variants = data.renderer, data.variants
+        elif self.mode == "server_map":
+            self.pages.setCurrentWidget(self.server_map)
+            self.server_map.load(*data)
+            self.update_map_status()
         elif self.mode == "textures":
             self.pages.setCurrentWidget(self.images)
             self.variants = data
@@ -356,7 +427,7 @@ class AssetWindow(QMainWindow):
             if self.audio is not None:
                 self.pages.setCurrentWidget(self.audio)
                 self.audio.load(source)
-                self.statusBar().showMessage("Ogg audio")
+                self.statusBar().showMessage("WAV audio" if source.suffix.casefold() == ".wav" else "Ogg audio")
         with QSignalBlocker(self.selector):
             self.selector.clear()
             self.selector.addItems([name for name, _ in self.variants])
@@ -369,6 +440,73 @@ class AssetWindow(QMainWindow):
         self.selector.setVisible(len(self.variants) > 1)
         if self.variants:
             self.select_variant(index)
+
+    def changed(self):
+        return self.mode == "server_map" and self.server_map.changed()
+
+    def confirm_discard(self):
+        return not self.changed() or QMessageBox.question(
+            self, "Unsaved Server Map", "Discard unsaved map or safe-zone edits?",
+            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+        ) == QMessageBox.StandardButton.Discard
+
+    def update_map_status(self):
+        visible = self.mode == "server_map"
+        self.save_map.setVisible(visible)
+        self.save_map.setEnabled(visible and self.server_map.map_changed() and self.studio.task is None)
+        self.save_zones.setVisible(visible and self.server_map.safe_config is not None)
+        self.save_zones.setEnabled(visible and self.server_map.safe_changed() and self.studio.task is None)
+        self.server_map.update_safe_save(self.save_zones.isEnabled())
+        if visible:
+            data = self.server_map.data
+            pending = " · Unsaved changes" if self.changed() else ""
+            self.setWindowTitle(self.source.name + (" *" if self.changed() else "") + " · Server Map")
+            self.statusBar().showMessage(f"{data.size:,} × {data.size:,} · Cell size {data.cell_size}{pending}")
+
+    def save_server_map(self):
+        if not self.save_map.isEnabled():
+            return
+        source, data, original = self.source, self.server_map.data, self.server_map.original
+        backups = self.studio.backup_folder()
+        if QMessageBox.question(
+            self, "Save Server Map", f"Save edits to {source}?\n\nBackup folder\n{backups}",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel,
+        ) != QMessageBox.StandardButton.Save:
+            return
+
+        def write():
+            raw = data.encode()
+            ServerMap.read(raw, source.name)
+            return save_model_table(source, original, raw, backups, format_name="SVMap", read=Path.read_bytes)
+
+        def saved(result):
+            catalog, backup = result
+            self.server_map.mark_saved(catalog)
+            self.update_map_status()
+            self.statusBar().showMessage(f"Saved · Backup {backup}")
+
+        self.studio.run_task("Saving server map…", write, saved)
+
+    def save_safe_zones(self):
+        if not self.save_zones.isEnabled():
+            return
+        view = self.server_map
+        path, original, zones, map_id = view.safe_path, view.safe_config, view.zones, view.map_id
+        if QMessageBox.question(
+            self, "Save Safe Zones", f"Save zones for map {map_id} to {path}?",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel,
+        ) != QMessageBox.StandardButton.Save:
+            return
+        backups = self.studio.backup_folder()
+
+        def saved(result):
+            config, backup = result
+            view.safe_config = config
+            view.zones = config.for_map(map_id)
+            self.update_map_status()
+            self.statusBar().showMessage(f"Saved SafeZones.INI · Backup {backup}")
+
+        self.studio.run_task("Saving safe zones…", lambda: original.save(path, map_id, zones, backups), saved)
 
     def select_variant(self, index):
         if not 0 <= index < len(self.variants):
@@ -385,7 +523,7 @@ class AssetWindow(QMainWindow):
             try:
                 image = read_image(Path(selected)) if selected else None
                 self.statusBar().showMessage(image.description if image else "Referenced texture is unavailable.")
-            except (OSError, ValueError, Image.DecompressionBombError) as error:
+            except (OSError, ValueError, DecompressionBombError) as error:
                 image = None
                 self.statusBar().showMessage(str(error))
             self.images.set_image(image)
@@ -429,6 +567,9 @@ class AssetWindow(QMainWindow):
         self.model.choice = self.model.renderer = None
         self.model.pane.clear()
         self.images.set_image(None)
+        self.server_map.clear()
+        self.save_map.setVisible(False)
+        self.save_zones.setVisible(False)
         if self.audio is not None:
             self.audio.clear()
         if self.font_id >= 0:
@@ -438,6 +579,9 @@ class AssetWindow(QMainWindow):
         self.statusBar().clearMessage()
 
     def closeEvent(self, event):
+        if self.mode == "server_map" and (self.studio.task is not None or not self.confirm_discard()):
+            event.ignore()
+            return
         self.settings.setValue("windows/assetSize", self.size())
         self.clear()
         super().closeEvent(event)

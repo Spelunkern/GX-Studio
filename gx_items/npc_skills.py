@@ -7,6 +7,7 @@ from PySide6.QtGui import QPixmap
 from . import seed
 from .catalog import Cursor, decode_text, read_file
 from .equipment_models import ModelAssets
+from .image_assets import icon_atlas
 
 SKILL_BYTES = 116
 SKILL_RANKS = 9
@@ -73,8 +74,7 @@ class NPCSkillAssets:
             return QPixmap()
         filename, row, col = location
         if filename not in self.sheets:
-            path = self.assets.resolve(f"interface/icon/{filename}")
-            self.sheets[filename] = QPixmap(str(path)) if path else QPixmap()
+            self.sheets[filename] = icon_atlas(self.assets, filename)
         atlas = self.sheets[filename]
         if atlas.isNull():
             return QPixmap()

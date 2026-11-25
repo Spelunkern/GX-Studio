@@ -108,6 +108,7 @@ class SkillWindow(QMainWindow):
         file_menu.addAction("&Close", "Ctrl+W", self.close)
         self.save = file_menu.addAction("&Save", "Ctrl+S", lambda: studio.review_skills(self))
         self.install = file_menu.addAction("&Install…", lambda: studio.install_skills(self))
+        self.install.setVisible(not studio.legacy)
         self.reload = file_menu.addAction("&Reload…", lambda: studio.reload_skills(self))
         edit = self.menuBar().addMenu("&Edit")
         self.edit_skill = edit.addAction("Edit Skill…", "Return", self.open_selected)
@@ -303,7 +304,7 @@ class SkillWindow(QMainWindow):
         if self.edits:
             info += f"    {len(self.edits):,} edited ranks"
         if self.catalog and not self.catalog.writable:
-            info += "    Encrypted (read-only)"
+            info += "    Read-only"
         self.statusBar().showMessage(info)
 
     def open_selected(self):

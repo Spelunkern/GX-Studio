@@ -80,8 +80,6 @@ def choices_for(family: int, name: str) -> tuple[tuple[int, str], ...]:
     kind = profile(family)
     if not kind:
         return ()
-    if name == "ReqOG":
-        return ((0, "Normal"), (1, "Restricted"))
     if name == "Slot":
         return tuple((i, str(i)) for i in range(7))
     if name == "ReqVG" and kind == "chest":

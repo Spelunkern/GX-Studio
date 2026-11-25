@@ -24,7 +24,7 @@ from .model_render import PreviewRenderer
 from .npcquest_data import EMPTY_LINKS, FLOAT, GATE_FIELDS, JOBS, NPC, NPC_FIELDS, QUEST_FIELDS, U8, Gate, Quest
 from .npcquest_data import empty_fields, text_bytes
 from .pickers import IconPicker
-from .seed import envelope_label
+from .seed import envelope_label, episode_label
 from .skill_sheet import SkillSizedDialog
 
 MERCHANTS, GATES, NPCS, QUESTS = range(4)
@@ -1196,6 +1196,7 @@ class NPCQuestWindow(QMainWindow):
         menu.addAction("&Close", "Ctrl+W", self.close)
         self.save = menu.addAction("&Save", "Ctrl+S", studio.save_npcquest)
         self.install = menu.addAction("&Install Rules to Server…", studio.install_npcquest)
+        self.install.setVisible(not studio.legacy)
         self.export = menu.addAction("Export Client Copy…", studio.export_npcquest)
         self.export_quest_sentences = menu.addAction("Export Sentences of a Quest…", self.export_sentences)
         self.reload = menu.addAction("&Reload…", studio.reload_npcquest)
@@ -1250,6 +1251,8 @@ class NPCQuestWindow(QMainWindow):
         sources.addWidget(self.server_info)
         sources.addStretch()
         sources.addWidget(self.choose_server)
+        self.choose_server.setVisible(not studio.legacy)
+        self.server_info.setVisible(not studio.legacy)
         layout.addLayout(sources)
         self.setCentralWidget(central)
         self.refresh()
@@ -1418,7 +1421,7 @@ class NPCQuestWindow(QMainWindow):
         self.save.setEnabled(editable and both_writable and self.changed())
         self.install.setEnabled(editable and self.server is not None and self.server.writable
                                 and (self.rules_differ or self.changed()))
-        self.export.setEnabled(loaded)
+        self.export.setEnabled(loaded and getattr(self.catalog, "legacy_episode", None) != "8")
         self.export_quest_sentences.setEnabled(loaded and selected and self.tabs.currentIndex() == QUESTS)
         self.reload.setEnabled(loaded)
         self.choose_server.setText("Server Data Settings…" if self.source == self.studio.client_quests else "Select Server File…")
@@ -1432,12 +1435,14 @@ class NPCQuestWindow(QMainWindow):
         self.client_info.setToolTip(str(self.source) if self.source else "")
         if self.server:
             rules = "Different rules" if self.rules_differ else "Rules in sync"
-            server_label = f"Server · {self.encryption(self.server)} · {rules}"
+            server_label = f"Server · {self.encryption(self.server)} · {episode_label(self.server)} · {rules}"
         else:
             server_label = "Server file unavailable" if self.server_error else "Server file not linked"
         self.server_info.setText(server_label if self.catalog else "")
         self.server_info.setToolTip(self.server_error or (str(self.server_path) if self.server_path else ""))
-        self.statusBar().showMessage(f"{self.proxy.rowCount():,} entries")
+        note = " · Read-only preview" if getattr(self.catalog, "legacy_preview", False) else ""
+        note += getattr(self.catalog, "legacy_text_status", "")
+        self.statusBar().showMessage(f"{self.proxy.rowCount():,} entries{note}")
 
     @staticmethod
     def encryption(catalog):

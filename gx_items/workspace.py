@@ -86,9 +86,9 @@ class Change:
 
 
 class Workspace:
-    def __init__(self, source: Path, database_path: Path | None = None):
+    def __init__(self, source: Path, database_path: Path | None = None, *, read_catalog=Catalog.open):
         self.source = source.resolve(strict=True)
-        self.catalog = Catalog.open(self.source)
+        self.catalog = read_catalog(self.source)
         self.database_path = database_path.resolve(strict=True) if database_path else None
         self.sql_rows: dict[int, dict[str, Scalar | None]] = {}
         if self.database_path:

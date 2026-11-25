@@ -11,7 +11,8 @@ from PySide6.QtWidgets import (
 )
 
 from .asset_models import AssetRenderer, ViewerAssets, animation_scenes, cloak_scenes, ctl_names, read_asset
-from .asset_view import AssetPreview, ImageView, read_image
+from .asset_view import AssetPreview, ImageView
+from .image_assets import read_image
 from .catalog import decode_text
 from .client_model_data import (
     ACTION, EMBLEM, EMBLEM_FILTER, PIN_OFFSET, AltCatalog, AltRecord, CloakCatalog, EmblemCatalog, TextureCatalog,

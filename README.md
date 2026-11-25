@@ -69,9 +69,10 @@ move with it. External paths keep their absolute locations.
 | `Monster.SData` and SQLite | Monster appearance, model preview, movement, attacks, resistances, experience, gold and drop grades. Separate client and SQLite saves. |
 | `.MON`, `.ITM`, `.IT2`, `.MLT`, `.ALT` | Model tables, equipment, animation references and supported effect bindings. |
 | Cloak `.PC` and `.CTL`, emblem `.DAT` | Cloak geometry and textures, emblem placement and texture catalogs. |
+| Server `.svmap` | Client minimap and editing for ladders, NPC patrols, monster areas, portals, spawn boxes, and named areas. |
 | Asset viewers | `.3DC`, `.3DO`, `.3DE`, `.ANI`, `.MANI`, `.VANI`, `.WTR`, `.SMOD`, `.DG`, `.EFT`, `.SEFF`, images, fonts and `.ogg`. |
 
-**Beta limits.** World maps (`.wld`, `.svmap`), several GX World catalogs
+**Beta limits.** Client world maps (`.wld`), several GX World catalogs
 and the Pets, Wings and Costumes item categories remain outside editing
 coverage. Some historical encrypted SData variants open read-only. The
 viewer renders models and authored effects for inspection. See the

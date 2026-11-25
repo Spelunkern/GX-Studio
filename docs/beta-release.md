@@ -1,16 +1,29 @@
-# GX Studio v0.1 Beta
+# GX Studio v0.1.0-beta.4
 
-The first standalone GX Studio beta for [Shaiya GX](https://github.com/Spelunkern/Shaiya-GX)
-includes portable downloads for Windows x64, Linux x64, macOS Apple silicon and
-macOS Intel. Extract the whole archive to a writable folder and launch GX Studio.
-The editor generates settings and dated backups in that folder.
+Portable builds are available for Windows x64, Linux x64, macOS Apple silicon,
+and macOS Intel. Extract the whole archive to a writable folder and launch
+GX Studio. The editor stores its settings and dated backups in that folder.
 
-- Configure loose Client Data, GX World files and SQLite from Workspace Settings.
-- Edit items, Item Mall products, skills, NPCs, quests, monsters and model tables.
-- Preview meshes, model bindings, complete effect sequences, textures and Ogg audio.
-- Review which source an edit targets before saving or installing changes.
+- **Legacy Data** opens client folders and SAH/SAF archives without connecting
+  to SQLite or GX World. It remembers the last client source and can extract
+  files to a folder you choose.
+- Legacy mode detects supported EP4.5, EP5.4, and EP6.4 layouts and can convert
+  supported EP4.5 and EP6.4 catalogs to GX EP5.4. It also opens EP7 clients with
+  compatible layouts and supports read-only EP8 BinarySData tables and quest
+  previews.
+- The server **SVMap editor** shows the client minimap, named-area labels and
+  source files, NPC patrols, portals, ladders, monster areas, and spawn boxes.
+  Draw monster areas, search monsters by name, preview their models, and move
+  selected spawn boxes after confirmation. Safe areas can be drawn and saved
+  separately to the server's `SafeZones.INI`.
+- **Monster.SData** distinguishes SQLite values that match the client from
+  values that differ. Review and stage a SQLite-to-client import for a single
+  monster or for all matching MobIDs.
+- The skill editors display Silence and Darkness in the correct slots. The
+  item editor shows all three `ReqOG` restrictions. The asset viewer opens
+  WAV audio and TGA textures.
 
-Use your own GX data. World maps (.wld and .svmap) and some server catalogs are
-outside this beta. The macOS packages are ad hoc signed without notarization.
+Archives contain the editor. Bring your own client and server data. The macOS
+apps are ad hoc signed. Full client `.wld` editing remains outside this beta.
 See the [user guide](https://github.com/Spelunkern/GX-Studio/blob/main/docs/editing.md)
-and check your archive against `SHA256SUMS.txt`.
+and verify your download against `SHA256SUMS.txt`.

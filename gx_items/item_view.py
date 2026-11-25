@@ -14,6 +14,7 @@ from .equipment_fields import HIDDEN_EQUIPMENT_FIELDS, REQUIREMENTS, choices_for
 from .equipment_models import ARMOR_TYPES, ModelAssets, has_equipment_durability, model_kind
 from .equipment_preview import EquipmentPreview, model_value
 from .fields import CLASSES, FIELDS_BY_NAME
+from .image_assets import icon_atlas
 from .item_controls import DebuffCombo, ForgeCostCombo, NameColorCombo, SpellGroupCombo
 from .lapis_fields import LAPIS_DEBUFF_FAMILIES, LAPIS_FAMILIES, LAPISIA, STAT_ROWS, TARGET_ROWS, choices_for_lapis, cost_label
 from .npc_skills import NPCSkillAssets
@@ -85,12 +86,12 @@ def find_child(directory: Path, name: str) -> Path:
 class ItemIcons:
     def __init__(self, data: Path):
         self.data = data
-        self.directory = find_child(find_child(data, "interface"), "icon")
+        self.assets = ModelAssets(data)
         self.sheet = lru_cache(maxsize=64)(self.sheet)
         self.pixmap = lru_cache(maxsize=2048)(self.pixmap)
 
     def sheet(self, filename: str) -> QPixmap:
-        return QPixmap(str(find_child(self.directory, filename)))
+        return icon_atlas(self.assets, filename)
 
     def debuff_icon(self, items: Iterable[Item], value: Callable[[Item, str], Scalar], code: int) -> QPixmap:
         for item in items:
@@ -484,6 +485,8 @@ class ItemDialog(QDialog):
         options = choices_for_lapis(self.item.family, name) if self.is_lapis else choices_for(self.item.family, name)
         if name in ("Country", "Attribute"):
             options = tuple(enumerate(FACTIONS if name == "Country" else ELEMENTS))
+        if name == "ReqOG":
+            options = ((0, "No Restriction"), (1, "Account Bound"), (2, "Character Bound"))
         if name == "AttackAdd" and self.attack_as_max:
             value = int(value) + int(self.model.value(self.item, "Attack"))
         if name == "ReqDex":

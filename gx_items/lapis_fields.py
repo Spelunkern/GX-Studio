@@ -47,6 +47,4 @@ def choices_for_lapis(family: int, name: str) -> tuple[tuple[int, str], ...]:
         return tuple((code, cost_label(family, code)) for code in GOLD_BY_COST)
     if name == "Slot":
         return ((0, "0 slots"), (1, "1 slot"), (2, "2 slots"), (3, "3 slots"))
-    if name == "ReqOG":
-        return ((0, "Normal"), (1, "Restricted"))
     return ()
