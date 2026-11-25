@@ -103,4 +103,5 @@ class MonsterAndClientModelsTest(unittest.TestCase):
             texture = folder / "001_FRONT.DDS"
             texture.touch()
             mode, entries = read_document(file, None)
-            self.assertEqual((mode, entries[0]), ("textures", ("1 · 001_front.dds", texture)))
+            self.assertEqual((mode, entries[0][0]), ("textures", "1 · 001_front.dds"))
+            self.assertTrue(entries[0][1].samefile(texture))

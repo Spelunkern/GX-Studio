@@ -42,7 +42,7 @@ spaces and Unicode in the path, runs the bundled application with
 `--check-startup` and creates the platform archive. For example:
 
 ```sh
-python tools/release_archive.py linux-x64 v0.1.0-beta.2
+python tools/release_archive.py linux-x64 v0.1.0-beta.3
 ```
 
 ## GitHub Releases
