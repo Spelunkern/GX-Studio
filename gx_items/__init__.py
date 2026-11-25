@@ -1,0 +1,1 @@
+"""Shaiya GX data editor."""
